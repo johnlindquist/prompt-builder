@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
 
     let skills_dirs = cli::default_skills_dirs(&cli.skills_dirs);
     let skills = skills::load_skills(&skills_dirs);
-    match app::run(prompt, skills)? {
+    match app::run(prompt, skills, launch_config.cwd.clone())? {
         AppExit::Submit(text) => finish_submit(&launch_config, &text, cli.dry_run),
         AppExit::Cancel => Ok(()),
     }

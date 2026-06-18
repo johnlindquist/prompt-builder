@@ -1,4 +1,7 @@
 use std::io;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 use codex_tui::ComposerAction;
@@ -31,9 +34,10 @@ pub enum AppExit {
     Cancel,
 }
 
-pub fn run(initial_prompt: String, skills: Vec<Skill>) -> anyhow::Result<AppExit> {
+pub fn run(initial_prompt: String, skills: Vec<Skill>, cwd: PathBuf) -> anyhow::Result<AppExit> {
     let mut terminal = setup_terminal()?;
-    let result = run_inner(&mut terminal, initial_prompt, skills);
+    let header = HeaderInfo::new(&cwd);
+    let result = run_inner(&mut terminal, initial_prompt, skills, header);
     restore_terminal()?;
     result
 }
@@ -42,6 +46,7 @@ fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial_prompt: String,
     skills: Vec<Skill>,
+    header: HeaderInfo,
 ) -> anyhow::Result<AppExit> {
     let mut composer = ComposerInput::new();
     composer.set_hint_items(vec![
@@ -56,7 +61,7 @@ fn run_inner(
     let mut skill_popup: Option<SkillPopup> = None;
 
     loop {
-        terminal.draw(|frame| draw(frame, &composer, &skills, skill_popup.as_ref()))?;
+        terminal.draw(|frame| draw(frame, &composer, &skills, skill_popup.as_ref(), &header))?;
 
         if composer.is_in_paste_burst() {
             std::thread::sleep(ComposerInput::recommended_flush_delay());
@@ -112,6 +117,7 @@ fn draw(
     composer: &ComposerInput,
     skills: &[Skill],
     skill_popup: Option<&SkillPopup>,
+    header: &HeaderInfo,
 ) {
     let area = frame.area();
     let layout = Layout::default()
@@ -119,9 +125,14 @@ fn draw(
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(area);
 
-    let title = Paragraph::new("Prompt Builder\nEnter sends to Codex. Ctrl+C cancels.")
-        .block(Block::default().borders(Borders::ALL).title("Codex input"));
-    frame.render_widget(title, layout[0]);
+    let header_lines = vec![
+        Line::from(vec!["cwd  ".into(), header.cwd.clone().into()]),
+        Line::from(vec!["git  ".into(), header.git.clone().into()]),
+    ];
+    frame.render_widget(
+        Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL)),
+        layout[0],
+    );
 
     let composer_height = composer
         .desired_height(layout[1].width)
@@ -156,6 +167,70 @@ fn popup_area(composer_area: Rect, popup: &SkillPopup, skills: &[Skill]) -> Rect
     let x = composer_area.x.saturating_add(1);
     let y = composer_area.y.saturating_sub(height);
     Rect::new(x, y, width, height)
+}
+
+struct HeaderInfo {
+    cwd: String,
+    git: String,
+}
+
+impl HeaderInfo {
+    fn new(cwd: &Path) -> Self {
+        Self {
+            cwd: display_cwd(cwd),
+            git: git_status(cwd),
+        }
+    }
+}
+
+fn display_cwd(cwd: &Path) -> String {
+    let path = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(cwd))
+            .unwrap_or_else(|_| cwd.to_path_buf())
+    };
+    path.canonicalize()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn git_status(cwd: &Path) -> String {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--short", "--branch"])
+        .output()
+    else {
+        return "git unavailable".to_string();
+    };
+    if !output.status.success() {
+        return "not a git repo".to_string();
+    }
+
+    summarize_git_status(String::from_utf8_lossy(&output.stdout).lines())
+}
+
+fn summarize_git_status<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let mut branch = "unknown".to_string();
+    let mut changed = 0usize;
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("## ") {
+            branch = rest.split("...").next().unwrap_or(rest).trim().to_string();
+        } else if !line.trim().is_empty() {
+            changed += 1;
+        }
+    }
+
+    if changed == 0 {
+        format!("{branch} clean")
+    } else if changed == 1 {
+        format!("{branch} 1 change")
+    } else {
+        format!("{branch} {changed} changes")
+    }
 }
 
 fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
