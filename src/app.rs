@@ -7,6 +7,7 @@ use crossterm::cursor::Show;
 use crossterm::event;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use crossterm::execute;
 use crossterm::terminal;
@@ -24,6 +25,8 @@ use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
 use ratatui::widgets::Paragraph;
 
+use crate::skill_popup::SkillPopup;
+use crate::skill_popup::SkillPopupAction;
 use crate::skills::Skill;
 
 pub enum AppExit {
@@ -53,9 +56,10 @@ fn run_inner(
         composer.handle_paste(initial_prompt);
         composer.flush_paste_burst_if_due();
     }
+    let mut skill_popup: Option<SkillPopup> = None;
 
     loop {
-        terminal.draw(|frame| draw(frame, &composer, &skills))?;
+        terminal.draw(|frame| draw(frame, &composer, &skills, skill_popup.as_ref()))?;
 
         if composer.is_in_paste_burst() {
             std::thread::sleep(ComposerInput::recommended_flush_delay());
@@ -73,12 +77,31 @@ fn run_inner(
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     return Ok(AppExit::Cancel);
                 }
+                if let Some(popup) = skill_popup.as_mut() {
+                    match popup.handle_key(key, &skills) {
+                        SkillPopupAction::None => {}
+                        SkillPopupAction::Cancel => skill_popup = None,
+                        SkillPopupAction::Insert(text) => {
+                            skill_popup = None;
+                            insert_text(&mut composer, &text);
+                        }
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::Char('$')
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                    && !skills.is_empty()
+                {
+                    skill_popup = Some(SkillPopup::default());
+                    continue;
+                }
                 match composer.input(key) {
                     ComposerAction::Submitted(text) => return Ok(AppExit::Submit(text)),
                     ComposerAction::None => {}
                 }
             }
             Event::Paste(text) => {
+                skill_popup = None;
                 composer.handle_paste(text);
             }
             Event::Resize(_, _) => {}
@@ -87,7 +110,12 @@ fn run_inner(
     }
 }
 
-fn draw(frame: &mut Frame<'_>, composer: &ComposerInput, skills: &[Skill]) {
+fn draw(
+    frame: &mut Frame<'_>,
+    composer: &ComposerInput,
+    skills: &[Skill],
+    skill_popup: Option<&SkillPopup>,
+) {
     let area = frame.area();
     let outer = Layout::default()
         .direction(Direction::Horizontal)
@@ -111,6 +139,10 @@ fn draw(frame: &mut Frame<'_>, composer: &ComposerInput, skills: &[Skill]) {
         .constraints([Constraint::Min(0), Constraint::Length(composer_height)])
         .split(left[1]);
     composer.render_ref(composer_rows[1], frame.buffer_mut());
+    if let Some(popup) = skill_popup {
+        let popup_area = popup_area(composer_rows[1], popup, skills);
+        popup.render(popup_area, frame.buffer_mut(), skills);
+    }
     if let Some((x, y)) = composer.cursor_pos(composer_rows[1]) {
         frame.set_cursor_position((x, y));
     }
@@ -124,8 +156,26 @@ fn draw(frame: &mut Frame<'_>, composer: &ComposerInput, skills: &[Skill]) {
     frame.render_widget(skills_list, outer[1]);
 }
 
+fn insert_text(composer: &mut ComposerInput, text: &str) {
+    for c in text.chars() {
+        let key = KeyEvent::from(KeyCode::Char(c));
+        let _ = composer.input(key);
+    }
+}
+
+fn popup_area(composer_area: Rect, popup: &SkillPopup, skills: &[Skill]) -> Rect {
+    let width = composer_area.width.saturating_sub(2).clamp(20, 64);
+    let height = popup
+        .required_height(skills)
+        .min(composer_area.y.saturating_sub(1))
+        .max(3);
+    let x = composer_area.x.saturating_add(1);
+    let y = composer_area.y.saturating_sub(height);
+    Rect::new(x, y, width, height)
+}
+
 fn render_skill(skill: &Skill) -> ListItem<'_> {
-    let mut lines = vec![Line::from(format!("${}", skill.name).cyan())];
+    let mut lines = vec![Line::from(skill.mention().cyan())];
     if !skill.description.is_empty() {
         lines.push(Line::from(skill.description.clone()).dim());
     }

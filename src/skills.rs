@@ -10,6 +10,12 @@ pub struct Skill {
     pub path: PathBuf,
 }
 
+impl Skill {
+    pub fn mention(&self) -> String {
+        format!("${}", self.name)
+    }
+}
+
 pub fn load_skills(dirs: &[PathBuf]) -> Vec<Skill> {
     let mut seen = HashSet::new();
     let mut skills = Vec::new();

@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod codex_spawn;
+mod skill_popup;
 mod skills;
 
 use std::io::IsTerminal;
