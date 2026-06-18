@@ -10,6 +10,7 @@ use std::io::Read;
 use clap::Parser;
 
 use crate::app::AppExit;
+use crate::app::TemplateInfo;
 use crate::cli::Cli;
 
 fn main() -> anyhow::Result<()> {
@@ -45,7 +46,8 @@ fn main() -> anyhow::Result<()> {
 
     let skills_dirs = cli::default_skills_dirs(&cli.skills_dirs);
     let skills = skills::load_skills(&skills_dirs);
-    match app::run(prompt, skills, launch_config.cwd.clone())? {
+    let template = TemplateInfo::from_parts(cli.template_label, cli.template_description);
+    match app::run(prompt, skills, launch_config.cwd.clone(), template)? {
         AppExit::Submit(text) => finish_submit(&launch_config, &text, cli.dry_run),
         AppExit::Cancel => Ok(()),
     }

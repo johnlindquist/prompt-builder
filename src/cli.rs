@@ -56,6 +56,14 @@ pub struct Cli {
     #[arg(long)]
     pub developer_instructions: Option<String>,
 
+    /// Label for wrapper-specific context shown in the TUI header.
+    #[arg(long = "template-label", value_name = "LABEL")]
+    pub template_label: Option<String>,
+
+    /// Description for wrapper-specific context shown in the TUI header.
+    #[arg(long = "template-description", value_name = "TEXT")]
+    pub template_description: Option<String>,
+
     /// Skills directory to scan. Repeatable.
     #[arg(long = "skills-dir", value_name = "DIR")]
     pub skills_dirs: Vec<PathBuf>,
@@ -138,6 +146,8 @@ mod tests {
             config: Vec::new(),
             instructions: Some("base\nrules".to_string()),
             developer_instructions: Some("debug \"carefully\"".to_string()),
+            template_label: None,
+            template_description: None,
             skills_dirs: Vec::new(),
             codex_bin: "codex".to_string(),
         };

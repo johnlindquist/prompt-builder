@@ -21,6 +21,7 @@ use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
 use ratatui::prelude::*;
+use ratatui::style::Stylize;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Paragraph;
@@ -34,9 +35,32 @@ pub enum AppExit {
     Cancel,
 }
 
-pub fn run(initial_prompt: String, skills: Vec<Skill>, cwd: PathBuf) -> anyhow::Result<AppExit> {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TemplateInfo {
+    label: Option<String>,
+    description: Option<String>,
+}
+
+impl TemplateInfo {
+    pub fn from_parts(label: Option<String>, description: Option<String>) -> Option<Self> {
+        if label.as_deref().unwrap_or_default().trim().is_empty()
+            && description.as_deref().unwrap_or_default().trim().is_empty()
+        {
+            return None;
+        }
+
+        Some(Self { label, description })
+    }
+}
+
+pub fn run(
+    initial_prompt: String,
+    skills: Vec<Skill>,
+    cwd: PathBuf,
+    template: Option<TemplateInfo>,
+) -> anyhow::Result<AppExit> {
     let mut terminal = setup_terminal()?;
-    let header = HeaderInfo::new(&cwd);
+    let header = HeaderInfo::new(&cwd, template);
     let result = run_inner(&mut terminal, initial_prompt, skills, header);
     restore_terminal()?;
     result
@@ -122,15 +146,11 @@ fn draw(
     let area = frame.area();
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(header.height()), Constraint::Min(1)])
         .split(area);
 
-    let header_lines = vec![
-        Line::from(header.cwd.clone()),
-        Line::from(vec!["git  ".into(), header.git.clone().into()]),
-    ];
     frame.render_widget(
-        Paragraph::new(header_lines).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(header.lines()).block(Block::default().borders(Borders::ALL)),
         layout[0],
     );
 
@@ -172,15 +192,53 @@ fn popup_area(composer_area: Rect, popup: &SkillPopup, skills: &[Skill]) -> Rect
 struct HeaderInfo {
     cwd: String,
     git: String,
+    template: Option<TemplateInfo>,
 }
 
 impl HeaderInfo {
-    fn new(cwd: &Path) -> Self {
+    fn new(cwd: &Path, template: Option<TemplateInfo>) -> Self {
         Self {
             cwd: display_cwd(cwd),
             git: git_status(cwd),
+            template,
         }
     }
+
+    fn height(&self) -> u16 {
+        if self.template.is_some() {
+            4
+        } else {
+            3
+        }
+    }
+
+    fn lines(&self) -> Vec<Line<'_>> {
+        let mut lines = vec![Line::from(self.cwd.clone())];
+        if let Some(template) = &self.template {
+            lines.push(template_line(template));
+        }
+        lines.push(Line::from(vec!["git  ".into(), self.git.clone().into()]));
+        lines
+    }
+}
+
+fn template_line(template: &TemplateInfo) -> Line<'_> {
+    let label = template
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or("Template");
+    let description = template
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .unwrap_or_default();
+    Line::from(vec![
+        format!("{label}: ").bold(),
+        description.to_string().into(),
+    ])
 }
 
 fn display_cwd(cwd: &Path) -> String {
@@ -244,4 +302,32 @@ pub fn restore_terminal() -> anyhow::Result<()> {
     terminal::disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen, Show)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_info_ignores_blank_metadata() {
+        assert_eq!(TemplateInfo::from_parts(None, None), None);
+        assert_eq!(
+            TemplateInfo::from_parts(Some(" ".to_string()), Some("\t".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn template_info_keeps_label_and_description() {
+        assert_eq!(
+            TemplateInfo::from_parts(
+                Some("Fix".to_string()),
+                Some("Run Fusion and verify.".to_string())
+            ),
+            Some(TemplateInfo {
+                label: Some("Fix".to_string()),
+                description: Some("Run Fusion and verify.".to_string()),
+            })
+        );
+    }
 }
