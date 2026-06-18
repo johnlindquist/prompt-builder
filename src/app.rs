@@ -18,11 +18,8 @@ use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
 use ratatui::prelude::*;
-use ratatui::style::Stylize;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
-use ratatui::widgets::List;
-use ratatui::widgets::ListItem;
 use ratatui::widgets::Paragraph;
 
 use crate::skill_popup::SkillPopup;
@@ -117,27 +114,22 @@ fn draw(
     skill_popup: Option<&SkillPopup>,
 ) {
     let area = frame.area();
-    let outer = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(34)])
-        .split(area);
-
-    let left = Layout::default()
+    let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(outer[0]);
+        .split(area);
 
     let title = Paragraph::new("Prompt Builder\nEnter sends to Codex. Ctrl+C cancels.")
         .block(Block::default().borders(Borders::ALL).title("Codex input"));
-    frame.render_widget(title, left[0]);
+    frame.render_widget(title, layout[0]);
 
     let composer_height = composer
-        .desired_height(left[1].width)
-        .clamp(3, left[1].height.max(3));
+        .desired_height(layout[1].width)
+        .clamp(3, layout[1].height.max(3));
     let composer_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(composer_height)])
-        .split(left[1]);
+        .split(layout[1]);
     composer.render_ref(composer_rows[1], frame.buffer_mut());
     if let Some(popup) = skill_popup {
         let popup_area = popup_area(composer_rows[1], popup, skills);
@@ -146,14 +138,6 @@ fn draw(
     if let Some((x, y)) = composer.cursor_pos(composer_rows[1]) {
         frame.set_cursor_position((x, y));
     }
-
-    let skill_items = skills.iter().map(render_skill).collect::<Vec<_>>();
-    let skills_list = List::new(skill_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Skills ({})", skills.len())),
-    );
-    frame.render_widget(skills_list, outer[1]);
 }
 
 fn insert_text(composer: &mut ComposerInput, text: &str) {
@@ -172,14 +156,6 @@ fn popup_area(composer_area: Rect, popup: &SkillPopup, skills: &[Skill]) -> Rect
     let x = composer_area.x.saturating_add(1);
     let y = composer_area.y.saturating_sub(height);
     Rect::new(x, y, width, height)
-}
-
-fn render_skill(skill: &Skill) -> ListItem<'_> {
-    let mut lines = vec![Line::from(skill.mention().cyan())];
-    if !skill.description.is_empty() {
-        lines.push(Line::from(skill.description.clone()).dim());
-    }
-    ListItem::new(lines)
 }
 
 fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
