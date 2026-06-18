@@ -126,7 +126,7 @@ fn draw(
         .split(area);
 
     let header_lines = vec![
-        Line::from(vec!["cwd  ".into(), header.cwd.clone().into()]),
+        Line::from(header.cwd.clone()),
         Line::from(vec!["git  ".into(), header.git.clone().into()]),
     ];
     frame.render_widget(
