@@ -8,10 +8,15 @@ use codex_tui::ComposerAction;
 use codex_tui::ComposerInput;
 use crossterm::cursor::Show;
 use crossterm::event;
+use crossterm::event::DisableBracketedPaste;
+use crossterm::event::EnableBracketedPaste;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use crossterm::event::KeyboardEnhancementFlags;
+use crossterm::event::PopKeyboardEnhancementFlags;
+use crossterm::event::PushKeyboardEnhancementFlags;
 use crossterm::execute;
 use crossterm::terminal;
 use crossterm::terminal::EnterAlternateScreen;
@@ -62,8 +67,11 @@ pub fn run(
     let mut terminal = setup_terminal()?;
     let header = HeaderInfo::new(&cwd, template);
     let result = run_inner(&mut terminal, initial_prompt, skills, header);
-    restore_terminal()?;
-    result
+    match (result, restore_terminal()) {
+        (Ok(exit), Ok(())) => Ok(exit),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
 }
 
 fn run_inner(
@@ -128,7 +136,7 @@ fn run_inner(
             }
             Event::Paste(text) => {
                 skill_popup = None;
-                composer.handle_paste(text);
+                composer.handle_paste(text.replace('\r', "\n"));
             }
             Event::Resize(_, _) => {}
             _ => {}
@@ -293,15 +301,33 @@ fn summarize_git_status<'a>(lines: impl Iterator<Item = &'a str>) -> String {
 
 fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
+    execute!(io::stdout(), EnableBracketedPaste)?;
+    let _ = execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     execute!(io::stdout(), EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     Terminal::new(backend).map_err(Into::into)
 }
 
 pub fn restore_terminal() -> anyhow::Result<()> {
-    terminal::disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, Show)?;
-    Ok(())
+    let mut first_error = None;
+    let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    if let Err(err) = execute!(io::stdout(), DisableBracketedPaste) {
+        first_error.get_or_insert_with(|| anyhow::Error::from(err));
+    }
+    if let Err(err) = terminal::disable_raw_mode() {
+        first_error.get_or_insert_with(|| anyhow::Error::from(err));
+    }
+    if let Err(err) = execute!(io::stdout(), LeaveAlternateScreen, Show) {
+        first_error.get_or_insert_with(|| anyhow::Error::from(err));
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +355,33 @@ mod tests {
                 description: Some("Run Fusion and verify.".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn composer_shift_enter_newlines_and_enter_submits() {
+        let mut composer = ComposerInput::new();
+
+        assert!(matches!(
+            composer.input(KeyEvent::from(KeyCode::Char('a'))),
+            ComposerAction::None
+        ));
+        std::thread::sleep(ComposerInput::recommended_flush_delay());
+        composer.flush_paste_burst_if_due();
+        assert!(matches!(
+            composer.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            ComposerAction::None
+        ));
+        std::thread::sleep(ComposerInput::recommended_flush_delay());
+        composer.flush_paste_burst_if_due();
+        assert!(matches!(
+            composer.input(KeyEvent::from(KeyCode::Char('b'))),
+            ComposerAction::None
+        ));
+        std::thread::sleep(ComposerInput::recommended_flush_delay());
+        composer.flush_paste_burst_if_due();
+        match composer.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            ComposerAction::Submitted(text) => assert_eq!(text, "a\nb"),
+            ComposerAction::None => panic!("plain Enter should submit"),
+        }
     }
 }

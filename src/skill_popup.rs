@@ -1,5 +1,6 @@
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
@@ -28,6 +29,10 @@ pub struct SkillPopup {
 
 impl SkillPopup {
     pub fn handle_key(&mut self, key: KeyEvent, skills: &[Skill]) -> SkillPopupAction {
+        if key.kind == KeyEventKind::Release {
+            return SkillPopupAction::None;
+        }
+
         match key.code {
             KeyCode::Esc => SkillPopupAction::Cancel,
             KeyCode::Enter | KeyCode::Tab => self
@@ -199,8 +204,10 @@ mod tests {
             skill("gemini-design", "Generate layouts"),
             skill("oracle-packx", "Bundle context"),
         ];
-        let mut popup = SkillPopup::default();
-        popup.query = "gd".to_string();
+        let mut popup = SkillPopup {
+            query: "gd".to_string(),
+            ..Default::default()
+        };
 
         assert_eq!(popup.matching_indices(&skills), vec![1]);
 
@@ -256,5 +263,19 @@ mod tests {
             popup.handle_key(KeyEvent::from(KeyCode::Enter), &skills),
             SkillPopupAction::Insert("$gemini-design".to_string())
         );
+    }
+
+    #[test]
+    fn release_events_do_not_mutate_query() {
+        let skills = vec![skill("fusion", "Run Fusion")];
+        let mut popup = SkillPopup::default();
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('$'),
+            KeyModifiers::SHIFT,
+            KeyEventKind::Release,
+        );
+
+        assert_eq!(popup.handle_key(release, &skills), SkillPopupAction::None);
+        assert_eq!(popup.query, "");
     }
 }
