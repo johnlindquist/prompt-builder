@@ -12,6 +12,10 @@ pub struct Cli {
     #[arg(value_name = "PROMPT")]
     pub prompt: Option<String>,
 
+    /// Conversation name to prefill or submit. The cwd prefix is added on submit.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
     /// Read stdin and append it to the initial prompt.
     #[arg(long)]
     pub stdin: bool,
@@ -75,6 +79,14 @@ pub struct Cli {
         default_value = "codex"
     )]
     pub codex_bin: String,
+
+    /// Command to run with the composed prompt as its final argument.
+    #[arg(long = "handoff-command", value_name = "PROGRAM")]
+    pub handoff_command: Option<String>,
+
+    /// Argument to pass to --handoff-command before the composed prompt. Repeatable.
+    #[arg(long = "handoff-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub handoff_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +96,12 @@ pub struct LaunchConfig {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub config: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffConfig {
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 impl Cli {
@@ -106,6 +124,13 @@ impl Cli {
             model: self.model.clone(),
             config,
         }
+    }
+
+    pub fn handoff_config(&self) -> Option<HandoffConfig> {
+        self.handoff_command.as_ref().map(|command| HandoffConfig {
+            command: command.clone(),
+            args: self.handoff_args.clone(),
+        })
     }
 }
 
@@ -135,6 +160,7 @@ mod tests {
     fn shorthand_config_values_are_toml_strings() {
         let cli = Cli {
             prompt: None,
+            name: None,
             stdin: false,
             submit: false,
             print_prompt: false,
@@ -150,6 +176,8 @@ mod tests {
             template_description: None,
             skills_dirs: Vec::new(),
             codex_bin: "codex".to_string(),
+            handoff_command: None,
+            handoff_args: Vec::new(),
         };
 
         assert_eq!(

@@ -27,16 +27,24 @@ pub fn codex_argv(config: &LaunchConfig, prompt: &str) -> Vec<String> {
     args
 }
 
-pub fn print_command(config: &LaunchConfig, prompt: &str) {
+pub fn print_command(config: &LaunchConfig, prompt: &str, thread_name: Option<&str>) {
     let rendered = codex_argv(config, prompt)
         .into_iter()
         .map(|arg| shell_quote(&arg))
         .collect::<Vec<_>>()
         .join(" ");
-    println!("{rendered}");
+    if let Some(thread_name) = thread_name {
+        println!("CODEX_THREAD_NAME={} {rendered}", shell_quote(thread_name));
+    } else {
+        println!("{rendered}");
+    }
 }
 
-pub fn launch(config: &LaunchConfig, prompt: &str) -> anyhow::Result<()> {
+pub fn launch(
+    config: &LaunchConfig,
+    prompt: &str,
+    thread_name: Option<&str>,
+) -> anyhow::Result<()> {
     let mut command = Command::new(&config.codex_bin);
     command
         .arg("--dangerously-bypass-approvals-and-sandbox")
@@ -52,6 +60,9 @@ pub fn launch(config: &LaunchConfig, prompt: &str) -> anyhow::Result<()> {
         command.arg("-c").arg(entry);
     }
     command.arg(prompt);
+    if let Some(thread_name) = thread_name {
+        command.env("CODEX_THREAD_NAME", thread_name);
+    }
 
     let status = command
         .status()
@@ -115,5 +126,38 @@ mod tests {
                 "fix".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn printed_command_can_include_thread_name_env() {
+        let config = LaunchConfig {
+            codex_bin: "codex".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            profile: None,
+            model: None,
+            config: Vec::new(),
+        };
+
+        assert_eq!(
+            render_command_for_test(&config, "fix", Some("/tmp/project:Fix")),
+            "CODEX_THREAD_NAME=/tmp/project:Fix codex --dangerously-bypass-approvals-and-sandbox -C /tmp/project fix"
+        );
+    }
+
+    fn render_command_for_test(
+        config: &LaunchConfig,
+        prompt: &str,
+        thread_name: Option<&str>,
+    ) -> String {
+        let rendered = codex_argv(config, prompt)
+            .into_iter()
+            .map(|arg| shell_quote(&arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(thread_name) = thread_name {
+            format!("CODEX_THREAD_NAME={} {rendered}", shell_quote(thread_name))
+        } else {
+            rendered
+        }
     }
 }

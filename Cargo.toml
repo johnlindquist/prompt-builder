@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5.58", features = ["derive", "env"] }
-codex-tui = { path = "../codex/codex-rs/tui" }
 crossterm = { version = "0.28.1", features = ["bracketed-paste", "event-stream"] }
 dirs = "6.0.0"
 ratatui = { version = "0.29.0", features = [
@@ -16,12 +15,8 @@ ratatui = { version = "0.29.0", features = [
     "unstable-widget-ref",
 ] }
 tempfile = "3.27.0"
+tui-textarea = "0.7.0"
 
 [patch.crates-io]
 crossterm = { git = "https://github.com/nornagon/crossterm", rev = "87db8bfa6dc99427fd3b071681b07fc31c6ce995" }
 ratatui = { git = "https://github.com/nornagon/ratatui", rev = "9b2ad1298408c45918ee9f8241a6f95498cdbed2" }
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }
-
-[patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
-tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "9200079d3b54a1ff51072e24d81fd354f085156f" }

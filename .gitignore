@@ -1,2 +1,16 @@
-/target/
+target/
+
+# OS/editor noise
 .DS_Store
+*.swp
+*.swo
+
+# Local environment/config
+.env
+.env.*
+!.env.example
+
+# Logs and temporary artifacts
+*.log
+tmp/
+temp/

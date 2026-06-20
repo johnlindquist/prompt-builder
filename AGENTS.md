@@ -9,7 +9,7 @@ This is a Rust terminal prompt builder for handing composed prompts to Codex. So
 - `app.rs`, `skill_popup.rs`, and `skills.rs` implement the Ratatui UI and skill loading.
 - `codex_spawn.rs` builds and launches the Codex command.
 
-`examples/fixit.zsh` contains a shell workflow example. There is no separate assets or integration test directory currently. The composer is intentionally taken from Codex itself via `codex_tui::ComposerInput`, so changes around input behavior should preserve compatibility with `~/dev/codex`. The crate depends on a local Codex TUI path dependency at `../codex/codex-rs/tui`, so keep that sibling checkout available when building.
+`examples/fixit.zsh` contains a shell workflow example. There is no separate assets or integration test directory currently. The composer is implemented locally in `composer_input.rs`; changes around input behavior should preserve the paste and submit behavior users expect from `~/dev/codex`.
 
 ## Build, Test, and Development Commands
 

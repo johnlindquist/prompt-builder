@@ -1,6 +1,6 @@
 # prompt-builder
 
-Rust terminal prompt builder that uses Codex's real `codex_tui::ComposerInput`.
+Rust terminal prompt builder for handing composed prompts to Codex.
 
 ## Run
 
@@ -49,6 +49,27 @@ Use a harmless binary to verify argv handoff:
 PROMPT_BUILDER_CODEX_BIN=/bin/echo cargo run -- --submit "hello"
 ```
 
+Compose first, then hand the submitted prompt to another command:
+
+```sh
+cargo run -- --handoff-command xfc
+cargo run -- --handoff-command x --handoff-arg fork --handoff-arg=--last
+```
+
+The composed prompt is passed as the final argv element, not through a shell string.
+
+Name a handoff conversation:
+
+```sh
+cargo run -- --name "Fix focused fork" --handoff-command xfc
+cargo run -- --submit --dry-run --name "Fix focused fork" --handoff-command xfc "continue"
+```
+
+The TUI starts in a single-line Name field above the prompt field. Press Tab to
+move between Name and Prompt. Submitted names are prefixed with the cwd basename
+as `<cwd-name>:<name>` and exported to handoff commands as `CODEX_THREAD_NAME`;
+the prompt remains the final argv element.
+
 ## Codex Options
 
 Pass Codex behavior options through:
@@ -81,4 +102,4 @@ fixit() {
 
 ## Notes
 
-This project path-depends on `../codex/codex-rs/tui` and mirrors Codex's patched `ratatui`, `crossterm`, `tokio-tungstenite`, and `tungstenite` dependencies so the real composer types match.
+This project intentionally keeps its TUI small. It mirrors Codex's paste and submit behavior locally instead of depending on Codex's full TUI crate.
