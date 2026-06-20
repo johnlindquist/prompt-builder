@@ -14,3 +14,4 @@ target/
 *.log
 tmp/
 temp/
+.codex-tmp/
