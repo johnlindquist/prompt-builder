@@ -4,16 +4,22 @@ use anyhow::Context;
 
 use crate::cli::HandoffConfig;
 
-pub fn handoff_argv(config: &HandoffConfig, prompt: &str) -> Vec<String> {
-    let mut args = Vec::with_capacity(config.args.len() + 2);
+pub fn handoff_argv(config: &HandoffConfig, prompt: &str, toggled_argv: &[String]) -> Vec<String> {
+    let mut args = Vec::with_capacity(config.args.len() + toggled_argv.len() + 2);
     args.push(config.command.clone());
     args.extend(config.args.iter().cloned());
+    args.extend(toggled_argv.iter().cloned());
     args.push(prompt.to_string());
     args
 }
 
-pub fn print_command(config: &HandoffConfig, prompt: &str, thread_name: Option<&str>) {
-    let rendered = handoff_argv(config, prompt)
+pub fn print_command(
+    config: &HandoffConfig,
+    prompt: &str,
+    thread_name: Option<&str>,
+    toggled_argv: &[String],
+) {
+    let rendered = handoff_argv(config, prompt, toggled_argv)
         .into_iter()
         .map(|arg| shell_quote(&arg))
         .collect::<Vec<_>>()
@@ -29,13 +35,14 @@ pub fn launch(
     config: &HandoffConfig,
     prompt: &str,
     thread_name: Option<&str>,
+    toggled_argv: &[String],
 ) -> anyhow::Result<()> {
     if prompt.trim().is_empty() {
         anyhow::bail!("prompt is empty");
     }
 
     let mut command = Command::new(&config.command);
-    command.args(&config.args).arg(prompt);
+    command.args(&config.args).args(toggled_argv).arg(prompt);
     if let Some(thread_name) = thread_name {
         command.env("CODEX_THREAD_NAME", thread_name);
     }
@@ -71,7 +78,7 @@ mod tests {
         let prompt = "fix this\nand keep $HOME literal";
 
         assert_eq!(
-            handoff_argv(&config, prompt),
+            handoff_argv(&config, prompt, &[]),
             vec![
                 "x".to_string(),
                 "resume".to_string(),
@@ -89,7 +96,7 @@ mod tests {
         };
 
         assert_eq!(
-            handoff_argv(&config, "continue"),
+            handoff_argv(&config, "continue", &[]),
             vec![
                 "x".to_string(),
                 "fork".to_string(),
@@ -106,7 +113,7 @@ mod tests {
             args: Vec::new(),
         };
 
-        let err = launch(&config, " \n\t ", None).expect_err("empty prompt should fail");
+        let err = launch(&config, " \n\t ", None, &[]).expect_err("empty prompt should fail");
 
         assert!(err.to_string().contains("prompt is empty"));
     }
@@ -119,8 +126,39 @@ mod tests {
         };
 
         assert_eq!(
-            render_command_for_test(&config, "continue", Some("/tmp/project:Fix it")),
+            render_command_for_test(&config, "continue", Some("/tmp/project:Fix it"), &[]),
             "CODEX_THREAD_NAME='/tmp/project:Fix it' x resume continue"
+        );
+    }
+
+    #[test]
+    fn toggled_args_precede_prompt() {
+        let config = HandoffConfig {
+            command: "zsh".to_string(),
+            args: vec![
+                "-lc".to_string(),
+                "xfc \"$@\"".to_string(),
+                "xfc".to_string(),
+            ],
+        };
+        let toggled = vec![
+            "--fork-from".to_string(),
+            "last".to_string(),
+            "--compact".to_string(),
+        ];
+
+        assert_eq!(
+            handoff_argv(&config, "continue", &toggled),
+            vec![
+                "zsh".to_string(),
+                "-lc".to_string(),
+                "xfc \"$@\"".to_string(),
+                "xfc".to_string(),
+                "--fork-from".to_string(),
+                "last".to_string(),
+                "--compact".to_string(),
+                "continue".to_string(),
+            ]
         );
     }
 
@@ -128,8 +166,9 @@ mod tests {
         config: &HandoffConfig,
         prompt: &str,
         thread_name: Option<&str>,
+        toggled_argv: &[String],
     ) -> String {
-        let rendered = handoff_argv(config, prompt)
+        let rendered = handoff_argv(config, prompt, toggled_argv)
             .into_iter()
             .map(|arg| shell_quote(&arg))
             .collect::<Vec<_>>()

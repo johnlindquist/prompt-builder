@@ -27,6 +27,31 @@ pub fn codex_argv(config: &LaunchConfig, prompt: &str) -> Vec<String> {
     args
 }
 
+pub fn resume_argv(config: &LaunchConfig, thread_id: &str, prompt: &str) -> Vec<String> {
+    let mut args = vec![
+        config.codex_bin.clone(),
+        "resume".to_string(),
+        "--dangerously-bypass-approvals-and-sandbox".to_string(),
+        "-C".to_string(),
+        config.cwd.to_string_lossy().to_string(),
+    ];
+    if let Some(profile) = &config.profile {
+        args.push("--profile".to_string());
+        args.push(profile.clone());
+    }
+    if let Some(model) = &config.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+    for entry in &config.config {
+        args.push("-c".to_string());
+        args.push(entry.clone());
+    }
+    args.push(thread_id.to_string());
+    args.push(prompt.to_string());
+    args
+}
+
 pub fn print_command(config: &LaunchConfig, prompt: &str, thread_name: Option<&str>) {
     let rendered = codex_argv(config, prompt)
         .into_iter()
@@ -69,6 +94,41 @@ pub fn launch(
         .with_context(|| format!("failed to launch {}", config.codex_bin))?;
     if !status.success() {
         anyhow::bail!("codex exited with {status}");
+    }
+    Ok(())
+}
+
+pub fn launch_resume(
+    config: &LaunchConfig,
+    thread_id: &str,
+    prompt: &str,
+    thread_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut command = Command::new(&config.codex_bin);
+    command
+        .arg("resume")
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .arg("-C")
+        .arg(&config.cwd);
+    if let Some(profile) = &config.profile {
+        command.arg("--profile").arg(profile);
+    }
+    if let Some(model) = &config.model {
+        command.arg("--model").arg(model);
+    }
+    for entry in &config.config {
+        command.arg("-c").arg(entry);
+    }
+    command.arg(thread_id).arg(prompt);
+    if let Some(thread_name) = thread_name {
+        command.env("CODEX_THREAD_NAME", thread_name);
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to launch {} resume", config.codex_bin))?;
+    if !status.success() {
+        anyhow::bail!("codex resume exited with {status}");
     }
     Ok(())
 }
@@ -123,6 +183,36 @@ mod tests {
                 "/tmp".to_string(),
                 "-c".to_string(),
                 "developer_instructions=debug carefully".to_string(),
+                "fix".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_argv_preserves_overrides_before_thread_id_and_prompt() {
+        let config = LaunchConfig {
+            codex_bin: "codex".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            profile: Some("fixit".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            config: vec!["developer_instructions=debug carefully".to_string()],
+        };
+
+        assert_eq!(
+            resume_argv(&config, "thread-id", "fix"),
+            vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "-C".to_string(),
+                "/tmp/project".to_string(),
+                "--profile".to_string(),
+                "fixit".to_string(),
+                "--model".to_string(),
+                "gpt-5.5".to_string(),
+                "-c".to_string(),
+                "developer_instructions=debug carefully".to_string(),
+                "thread-id".to_string(),
                 "fix".to_string(),
             ]
         );

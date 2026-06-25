@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -14,12 +12,24 @@ use ratatui::widgets::Widget;
 use tui_textarea::CursorMove;
 use tui_textarea::TextArea;
 
+use crate::file_search;
+use crate::file_search::AtToken;
+use crate::slash_commands;
+
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 const MAX_COMPOSER_HEIGHT: u16 = 16;
 
 pub enum ComposerAction {
     Submitted(String),
     None,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashToken {
+    pub query: String,
+    pub start: usize,
+    pub end: usize,
+    pub has_space_after: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,7 +58,13 @@ impl ComposerInput {
             return ComposerAction::None;
         }
 
-        if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        if is_newline_key(key) {
+            self.textarea.insert_newline();
+            self.reconcile_pending_pastes();
+            return ComposerAction::None;
+        }
+
+        if key.code == KeyCode::Enter && key.modifiers.is_empty() {
             let text = self.submission_text();
             if !text.trim().is_empty() {
                 self.pending_pastes.clear();
@@ -187,20 +203,26 @@ impl ComposerInput {
         );
     }
 
-    pub fn is_in_paste_burst(&self) -> bool {
-        false
-    }
-
-    pub fn flush_paste_burst_if_due(&mut self) -> bool {
-        false
-    }
-
-    pub fn recommended_flush_delay() -> Duration {
-        Duration::from_millis(25)
-    }
-
-    fn text(&self) -> String {
+    pub fn text(&self) -> String {
         self.textarea.lines().join("\n")
+    }
+
+    pub fn current_at_token(&self, allow_empty: bool) -> Option<AtToken> {
+        file_search::current_at_token(&self.text(), self.cursor_char_index(), allow_empty)
+    }
+
+    pub fn current_slash_token(&self) -> Option<SlashToken> {
+        current_slash_token(&self.text(), self.cursor_char_index())
+    }
+
+    pub fn replace_char_range(&mut self, start: usize, end: usize, replacement: &str) {
+        let text = self.text();
+        let mut updated = text.chars().take(start).collect::<String>();
+        updated.push_str(replacement);
+        updated.extend(text.chars().skip(end));
+        let cursor = start + replacement.chars().count();
+        self.set_text_and_cursor(&updated, cursor);
+        self.reconcile_pending_pastes();
     }
 
     fn submission_text(&self) -> String {
@@ -316,7 +338,7 @@ impl ComposerInput {
         true
     }
 
-    fn cursor_char_index(&self) -> usize {
+    pub fn cursor_char_index(&self) -> usize {
         let (row, col) = self.textarea.cursor();
         self.textarea
             .lines()
@@ -415,6 +437,90 @@ fn row_col_for_char_index(text: &str, char_index: usize) -> (usize, usize) {
         .map(Iterator::count)
         .unwrap_or_default();
     (row, col)
+}
+
+fn is_newline_key(key: KeyEvent) -> bool {
+    let (code, modifiers) = normalize_key_parts(key.code, key.modifiers);
+    matches!(
+        (code, modifiers),
+        (KeyCode::Enter, modifiers)
+            if modifiers.contains(KeyModifiers::SHIFT)
+                || modifiers.contains(KeyModifiers::ALT)
+                || modifiers.contains(KeyModifiers::CONTROL)
+    ) || matches!(
+        (code, modifiers),
+        (KeyCode::Char('j'), modifiers) | (KeyCode::Char('m'), modifiers)
+            if modifiers.contains(KeyModifiers::CONTROL)
+    )
+}
+
+fn normalize_key_parts(code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    let KeyCode::Char(ch) = code else {
+        return (code, modifiers);
+    };
+    if let Some(ctrl_char) = c0_control_char_to_ctrl_char(ch) {
+        modifiers.insert(KeyModifiers::CONTROL);
+        return (KeyCode::Char(ctrl_char), modifiers);
+    }
+    if ch.is_ascii_uppercase() {
+        modifiers.insert(KeyModifiers::SHIFT);
+        return (KeyCode::Char(ch.to_ascii_lowercase()), modifiers);
+    }
+    (code, modifiers)
+}
+
+pub(crate) fn normalize_key_for_binding(key: KeyEvent) -> KeyEvent {
+    let (code, modifiers) = normalize_key_parts(key.code, key.modifiers);
+    KeyEvent::new_with_kind(code, modifiers, key.kind)
+}
+
+fn c0_control_char_to_ctrl_char(ch: char) -> Option<char> {
+    let code = u32::from(ch);
+    match code {
+        0x00 => Some(' '),
+        0x01..=0x1a => char::from_u32(code - 0x01 + u32::from('a')),
+        0x1c..=0x1f => char::from_u32(code - 0x1c + u32::from('4')),
+        _ => None,
+    }
+}
+
+fn current_slash_token(text: &str, cursor: usize) -> Option<SlashToken> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    if chars.first() != Some(&'/') {
+        return None;
+    }
+
+    let first_line_end = chars
+        .iter()
+        .position(|ch| *ch == '\n')
+        .unwrap_or(chars.len());
+    if cursor > first_line_end {
+        return None;
+    }
+    if first_line_end > 1 && chars.get(1).is_some_and(|ch| ch.is_whitespace()) {
+        return None;
+    }
+
+    let mut token_end = 1;
+    while token_end < first_line_end && !chars[token_end].is_whitespace() {
+        token_end += 1;
+    }
+    if !(1..=token_end).contains(&cursor) {
+        return None;
+    }
+
+    let query = chars[1..token_end].iter().collect::<String>();
+    if query.contains('/') || !slash_commands::has_command_prefix(&query) {
+        return None;
+    }
+    let has_space_after = chars.get(token_end).is_some_and(|ch| ch.is_whitespace());
+    Some(SlashToken {
+        query,
+        start: 0,
+        end: token_end,
+        has_space_after,
+    })
 }
 
 #[cfg(test)]
@@ -566,6 +672,115 @@ mod tests {
     }
 
     #[test]
+    fn replace_char_range_preserves_large_paste_payloads() {
+        let mut composer = ComposerInput::new();
+        let pasted = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        let placeholder = format!("[Pasted Content {} chars]", pasted.chars().count());
+        composer.handle_paste(pasted.clone());
+        composer.set_initial_text(" fix @ma");
+        let token = composer
+            .current_at_token(true)
+            .expect("expected active @ token");
+
+        composer.replace_char_range(token.start, token.end, "src/main.rs ");
+
+        assert_eq!(composer.text(), format!("{placeholder} fix src/main.rs "));
+        assert_eq!(
+            composer.submission_text(),
+            format!("{pasted} fix src/main.rs ")
+        );
+    }
+
+    #[test]
+    fn slash_token_detects_bare_slash() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("/");
+
+        assert_eq!(
+            composer.current_slash_token(),
+            Some(SlashToken {
+                query: String::new(),
+                start: 0,
+                end: 1,
+                has_space_after: false,
+            })
+        );
+    }
+
+    #[test]
+    fn slash_token_detects_command_prefix() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("/re");
+
+        assert_eq!(
+            composer.current_slash_token(),
+            Some(SlashToken {
+                query: "re".to_string(),
+                start: 0,
+                end: 3,
+                has_space_after: false,
+            })
+        );
+    }
+
+    #[test]
+    fn slash_token_ignores_plain_text_cases() {
+        for text in [
+            "/ test",
+            " /review",
+            "/etc/hosts",
+            "hello /review",
+            "hello\n/review",
+        ] {
+            let mut composer = ComposerInput::new();
+            composer.set_initial_text(text);
+
+            assert_eq!(composer.current_slash_token(), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn slash_token_uses_fuzzy_activation_but_ignores_unknowns() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("/ac");
+
+        assert_eq!(
+            composer.current_slash_token(),
+            Some(SlashToken {
+                query: "ac".to_string(),
+                start: 0,
+                end: 3,
+                has_space_after: false,
+            })
+        );
+
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("/zzz");
+        assert_eq!(composer.current_slash_token(), None);
+    }
+
+    #[test]
+    fn slash_token_ends_before_args() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("/review arg");
+        for _ in 0.." arg".chars().count() {
+            composer.input(KeyEvent::from(KeyCode::Left));
+        }
+
+        assert_eq!(
+            composer.current_slash_token(),
+            Some(SlashToken {
+                query: "review".to_string(),
+                start: 0,
+                end: 7,
+                has_space_after: true,
+            })
+        );
+        composer.input(KeyEvent::from(KeyCode::Right));
+        assert_eq!(composer.current_slash_token(), None);
+    }
+
+    #[test]
     fn release_event_does_not_mutate_text() {
         let mut composer = ComposerInput::new();
         let release = KeyEvent::new_with_kind(
@@ -576,6 +791,89 @@ mod tests {
 
         assert!(matches!(composer.input(release), ComposerAction::None));
         assert_eq!(composer.text(), "");
+    }
+
+    #[test]
+    fn modified_enter_variants_insert_newlines() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("a");
+
+        assert!(matches!(
+            composer.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('b')));
+        assert!(matches!(
+            composer.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(
+            composer.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('d')));
+
+        assert_eq!(composer.text(), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn codex_newline_aliases_insert_newlines() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("a");
+
+        assert!(matches!(
+            composer.input(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('b')));
+        assert!(matches!(
+            composer.input(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL)),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(
+            composer.input(KeyEvent::from(KeyCode::Char('\n'))),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('d')));
+        assert!(matches!(
+            composer.input(KeyEvent::from(KeyCode::Char('\r'))),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('e')));
+
+        assert_eq!(composer.text(), "a\nb\nc\nd\ne");
+    }
+
+    #[test]
+    fn modified_raw_cr_and_lf_insert_newlines() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("a");
+
+        assert!(matches!(
+            composer.input(KeyEvent::new(KeyCode::Char('\r'), KeyModifiers::SHIFT)),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('b')));
+        assert!(matches!(
+            composer.input(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::SHIFT)),
+            ComposerAction::None
+        ));
+        composer.input(KeyEvent::from(KeyCode::Char('c')));
+
+        assert_eq!(composer.text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn enter_release_does_not_submit_or_insert_newline() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("a");
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::SHIFT, KeyEventKind::Release);
+
+        assert!(matches!(composer.input(release), ComposerAction::None));
+        assert_eq!(composer.text(), "a");
     }
 
     fn row_text(buffer: &Buffer, x: u16, y: u16, width: u16) -> String {

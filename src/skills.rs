@@ -94,8 +94,10 @@ fn parse_skill(path: &Path, text: &str) -> Skill {
 }
 
 fn frontmatter(text: &str) -> Option<&str> {
-    let rest = text.strip_prefix("---\n")?;
-    let end = rest.find("\n---")?;
+    let rest = text
+        .strip_prefix("---\r\n")
+        .or_else(|| text.strip_prefix("---\n"))?;
+    let end = rest.find("\n---").or_else(|| rest.find("\r\n---"))?;
     Some(&rest[..end])
 }
 
@@ -128,5 +130,16 @@ mod tests {
                 path: PathBuf::from("/tmp/fusion/SKILL.md"),
             }
         );
+    }
+
+    #[test]
+    fn parses_crlf_frontmatter_name_and_description() {
+        let skill = parse_skill(
+            Path::new("/tmp/fusion/SKILL.md"),
+            "---\r\nname: fusion\r\ndescription: Run Fusion\r\n---\r\n# Fallback\r\n",
+        );
+
+        assert_eq!(skill.name, "fusion");
+        assert_eq!(skill.description, "Run Fusion");
     }
 }

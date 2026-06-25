@@ -19,6 +19,7 @@ pub enum SkillPopupAction {
     None,
     Insert(String),
     Cancel,
+    Forward,
 }
 
 #[derive(Debug, Default)]
@@ -35,7 +36,12 @@ impl SkillPopup {
 
         match key.code {
             KeyCode::Esc => SkillPopupAction::Cancel,
-            KeyCode::Enter | KeyCode::Tab => self
+            KeyCode::Tab => self
+                .selected_skill(skills)
+                .map_or(SkillPopupAction::Cancel, |skill| {
+                    SkillPopupAction::Insert(skill.mention())
+                }),
+            KeyCode::Enter if key.modifiers.is_empty() => self
                 .selected_skill(skills)
                 .map_or(SkillPopupAction::Cancel, |skill| {
                     SkillPopupAction::Insert(skill.mention())
@@ -64,7 +70,7 @@ impl SkillPopup {
                 self.clamp_selection(skills);
                 SkillPopupAction::None
             }
-            _ => SkillPopupAction::None,
+            _ => SkillPopupAction::Forward,
         }
     }
 
@@ -244,6 +250,17 @@ mod tests {
         assert_eq!(
             popup.handle_key(KeyEvent::from(KeyCode::Enter), &skills),
             SkillPopupAction::Insert("$fusion".to_string())
+        );
+    }
+
+    #[test]
+    fn shift_enter_forwards_to_composer() {
+        let skills = vec![skill("fusion", "Run Fusion")];
+        let mut popup = SkillPopup::default();
+
+        assert_eq!(
+            popup.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &skills),
+            SkillPopupAction::Forward
         );
     }
 

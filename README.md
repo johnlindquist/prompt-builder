@@ -59,6 +59,13 @@ prompt-builder --dry-run --print-command "hello"
 PROMPT_BUILDER_CODEX_BIN=/bin/echo prompt-builder --submit "hello"
 ```
 
+For scripts that should avoid parsing shell-quoted command text, print the raw
+launch manifest:
+
+```sh
+prompt-builder --print-launch-json "hello"
+```
+
 ## Quick Start
 
 Open the interactive composer:
@@ -96,7 +103,13 @@ prompt-builder --submit --dry-run --name "Fix focused fork" "continue"
 
 The TUI starts in a single-line Name field above the Prompt field. Press Tab to
 move between fields. Submitted names are prefixed with the cwd basename as
-`<cwd-name>:<name>` and exported to child commands as `CODEX_THREAD_NAME`.
+`<cwd-name>:<name>`.
+
+For default non-handoff submissions, named prompts create the Codex thread
+through `codex app-server`, call `thread/name/set`, then resume the named thread
+with the composed prompt. Unnamed prompts keep the direct `codex ... <prompt>`
+launch path. Handoff submissions export the name to child commands as
+`CODEX_THREAD_NAME` so wrappers can apply their own naming behavior.
 
 ## Handoff Mode
 
@@ -110,6 +123,24 @@ prompt-builder --submit --dry-run --handoff-command /bin/echo "hello"
 ```
 
 The prompt is passed with `Command::arg`, not through shell eval.
+
+Shortcut and wrapper flows can prefill bottom-bar launch toggles:
+
+```sh
+prompt-builder --handoff-command xfc --fork-from last --compact
+prompt-builder --submit --dry-run --handoff-command /bin/echo \
+  --fork-from 019edc7e-e0ed-7883-9e03-348c64771b1f --compact "continue"
+prompt-builder --handoff-command my-wrapper \
+  --launch-option "app-server trace=--trace-app-server"
+```
+
+In the TUI, these options appear below the prompt as checkbox-style toggles.
+Press Tab to move Name → Prompt → each option, then Space to toggle the focused
+option on or off. Enabled option argv is inserted after static handoff args and
+before the final prompt argument. The wrapper owns any fork/compact app-server
+orchestration; `prompt-builder` only composes, displays, and forwards the
+selected option tokens. Use repeated `--launch-option "Label=arg,arg"` entries
+for wrapper-specific options beyond `--fork-from` and `--compact`.
 
 ## Codex Options
 
