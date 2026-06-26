@@ -161,7 +161,7 @@ mod tests {
         assert!(json.contains("\"schema_version\": 1"));
         assert!(json.contains("\"mode\": \"codex\""));
         assert!(json.contains("\"command\": \"codex\""));
-        assert!(json.contains("\"argv\": [\"codex\", \"--dangerously-bypass-approvals-and-sandbox\", \"-C\", \"/tmp/project\", \"--profile\", \"fixit\", \"-c\", \"developer_instructions=debug carefully\", \"fix \\\"x\\\"\\n\\t诶\\u0001\"]"));
+        assert!(json.contains("\"argv\": [\"codex\", \"--dangerously-bypass-approvals-and-sandbox\", \"-C\", \"/tmp/project\", \"--profile\", \"fixit\", \"-c\", \"developer_instructions=debug carefully\", \"--\", \"fix \\\"x\\\"\\n\\t诶\\u0001\"]"));
         assert!(json.contains("\"CODEX_THREAD_NAME\": \"project:Fix\""));
     }
 

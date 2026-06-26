@@ -23,6 +23,7 @@ pub fn codex_argv(config: &LaunchConfig, prompt: &str) -> Vec<String> {
         args.push("-c".to_string());
         args.push(entry.clone());
     }
+    args.push("--".to_string());
     args.push(prompt.to_string());
     args
 }
@@ -47,6 +48,7 @@ pub fn resume_argv(config: &LaunchConfig, thread_id: &str, prompt: &str) -> Vec<
         args.push("-c".to_string());
         args.push(entry.clone());
     }
+    args.push("--".to_string());
     args.push(thread_id.to_string());
     args.push(prompt.to_string());
     args
@@ -84,6 +86,7 @@ pub fn launch(
     for entry in &config.config {
         command.arg("-c").arg(entry);
     }
+    command.arg("--");
     command.arg(prompt);
     if let Some(thread_name) = thread_name {
         command.env("CODEX_THREAD_NAME", thread_name);
@@ -119,7 +122,7 @@ pub fn launch_resume(
     for entry in &config.config {
         command.arg("-c").arg(entry);
     }
-    command.arg(thread_id).arg(prompt);
+    command.arg("--").arg(thread_id).arg(prompt);
     if let Some(thread_name) = thread_name {
         command.env("CODEX_THREAD_NAME", thread_name);
     }
@@ -183,6 +186,7 @@ mod tests {
                 "/tmp".to_string(),
                 "-c".to_string(),
                 "developer_instructions=debug carefully".to_string(),
+                "--".to_string(),
                 "fix".to_string(),
             ]
         );
@@ -212,8 +216,57 @@ mod tests {
                 "gpt-5.5".to_string(),
                 "-c".to_string(),
                 "developer_instructions=debug carefully".to_string(),
+                "--".to_string(),
                 "thread-id".to_string(),
                 "fix".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_argv_delimits_hyphen_prefixed_prompt() {
+        let config = LaunchConfig {
+            codex_bin: "codex".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            profile: None,
+            model: None,
+            config: Vec::new(),
+        };
+
+        assert_eq!(
+            codex_argv(&config, "-create an imp").as_slice(),
+            [
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                "/tmp",
+                "--",
+                "-create an imp",
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_argv_delimits_hyphen_prefixed_prompt() {
+        let config = LaunchConfig {
+            codex_bin: "codex".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            profile: None,
+            model: None,
+            config: Vec::new(),
+        };
+
+        assert_eq!(
+            resume_argv(&config, "thread-id", "-create an imp").as_slice(),
+            [
+                "codex",
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                "/tmp",
+                "--",
+                "thread-id",
+                "-create an imp",
             ]
         );
     }
@@ -230,7 +283,7 @@ mod tests {
 
         assert_eq!(
             render_command_for_test(&config, "fix", Some("/tmp/project:Fix")),
-            "CODEX_THREAD_NAME=/tmp/project:Fix codex --dangerously-bypass-approvals-and-sandbox -C /tmp/project fix"
+            "CODEX_THREAD_NAME=/tmp/project:Fix codex --dangerously-bypass-approvals-and-sandbox -C /tmp/project -- fix"
         );
     }
 

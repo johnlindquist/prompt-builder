@@ -214,6 +214,7 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox".to_string(),
                 "-C".to_string(),
                 "/tmp/project".to_string(),
+                "--".to_string(),
                 "<created-thread-id>".to_string(),
                 "fix".to_string(),
             ]
