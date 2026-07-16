@@ -23,6 +23,7 @@ pub fn codex_argv(config: &LaunchConfig, prompt: &str) -> Vec<String> {
         args.push("-c".to_string());
         args.push(entry.clone());
     }
+    args.extend(config.args.iter().cloned());
     args.push("--".to_string());
     args.push(prompt.to_string());
     args
@@ -48,6 +49,7 @@ pub fn resume_argv(config: &LaunchConfig, thread_id: &str, prompt: &str) -> Vec<
         args.push("-c".to_string());
         args.push(entry.clone());
     }
+    args.extend(config.args.iter().cloned());
     args.push("--".to_string());
     args.push(thread_id.to_string());
     args.push(prompt.to_string());
@@ -60,11 +62,17 @@ pub fn print_command(config: &LaunchConfig, prompt: &str, thread_name: Option<&s
         .map(|arg| shell_quote(&arg))
         .collect::<Vec<_>>()
         .join(" ");
+    let mut prefix = env_prefix(&config.env);
     if let Some(thread_name) = thread_name {
-        println!("CODEX_THREAD_NAME={} {rendered}", shell_quote(thread_name));
-    } else {
-        println!("{rendered}");
+        prefix.push_str(&format!("CODEX_THREAD_NAME={} ", shell_quote(thread_name)));
     }
+    println!("{prefix}{rendered}");
+}
+
+pub fn env_prefix(env: &[(String, String)]) -> String {
+    env.iter()
+        .map(|(key, value)| format!("{key}={} ", shell_quote(value)))
+        .collect()
 }
 
 pub fn launch(
@@ -86,8 +94,10 @@ pub fn launch(
     for entry in &config.config {
         command.arg("-c").arg(entry);
     }
+    command.args(&config.args);
     command.arg("--");
     command.arg(prompt);
+    command.envs(config.env.iter().map(|(key, value)| (key, value)));
     if let Some(thread_name) = thread_name {
         command.env("CODEX_THREAD_NAME", thread_name);
     }
@@ -122,7 +132,9 @@ pub fn launch_resume(
     for entry in &config.config {
         command.arg("-c").arg(entry);
     }
+    command.args(&config.args);
     command.arg("--").arg(thread_id).arg(prompt);
+    command.envs(config.env.iter().map(|(key, value)| (key, value)));
     if let Some(thread_name) = thread_name {
         command.env("CODEX_THREAD_NAME", thread_name);
     }
@@ -160,6 +172,8 @@ mod tests {
             profile: None,
             model: None,
             config: Vec::new(),
+            args: Vec::new(),
+            env: Vec::new(),
         };
 
         let args = codex_argv(&config, "one\ntwo");
@@ -175,6 +189,8 @@ mod tests {
             profile: None,
             model: None,
             config: vec!["developer_instructions=debug carefully".to_string()],
+            args: Vec::new(),
+            env: Vec::new(),
         };
 
         assert_eq!(
@@ -200,6 +216,8 @@ mod tests {
             profile: Some("fixit".to_string()),
             model: Some("gpt-5.5".to_string()),
             config: vec!["developer_instructions=debug carefully".to_string()],
+            args: Vec::new(),
+            env: Vec::new(),
         };
 
         assert_eq!(
@@ -231,6 +249,8 @@ mod tests {
             profile: None,
             model: None,
             config: Vec::new(),
+            args: Vec::new(),
+            env: Vec::new(),
         };
 
         assert_eq!(
@@ -254,6 +274,8 @@ mod tests {
             profile: None,
             model: None,
             config: Vec::new(),
+            args: Vec::new(),
+            env: Vec::new(),
         };
 
         assert_eq!(
@@ -279,6 +301,8 @@ mod tests {
             profile: None,
             model: None,
             config: Vec::new(),
+            args: Vec::new(),
+            env: Vec::new(),
         };
 
         assert_eq!(

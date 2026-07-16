@@ -19,6 +19,7 @@ pub fn named_thread_argv(config: &LaunchConfig, prompt: &str, thread_name: &str)
 }
 
 pub fn print_command(config: &LaunchConfig, prompt: &str, thread_name: &str) {
+    let env = codex_spawn::env_prefix(&config.env);
     let app_server = [config.codex_bin.as_str(), "app-server", "--stdio"]
         .into_iter()
         .map(shell_quote)
@@ -30,7 +31,7 @@ pub fn print_command(config: &LaunchConfig, prompt: &str, thread_name: &str) {
         .collect::<Vec<_>>()
         .join(" ");
     println!(
-        "{app_server}  # JSON-RPC: thread/start; thread/name/set {}; then {resume}",
+        "{env}{app_server}  # JSON-RPC: thread/start; thread/name/set {}; then {env}{resume}",
         shell_quote(thread_name)
     );
 }
@@ -61,6 +62,7 @@ impl AppServerClient {
         let mut child = Command::new(&config.codex_bin)
             .arg("app-server")
             .arg("--stdio")
+            .envs(config.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -204,6 +206,8 @@ mod tests {
             profile: None,
             model: None,
             config: Vec::new(),
+            args: Vec::new(),
+            env: Vec::new(),
         };
 
         assert_eq!(

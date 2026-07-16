@@ -3,7 +3,6 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::prelude::*;
-use ratatui::style::Stylize;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
@@ -11,6 +10,7 @@ use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
 
 use crate::file_search::FileMatch;
+use crate::theme::Theme;
 
 const MAX_ROWS: usize = 8;
 
@@ -85,7 +85,7 @@ impl FilePopup {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let title = if self.query.is_empty() {
             "Files @".to_string()
         } else {
@@ -96,17 +96,29 @@ impl FilePopup {
             .saturating_sub(MAX_ROWS - 1)
             .min(self.matches.len().saturating_sub(MAX_ROWS));
         let items = if self.matches.is_empty() {
-            vec![ListItem::new(Line::from("no matches".dim()))]
+            vec![ListItem::new(Line::from(Span::styled(
+                "no matches",
+                theme.muted_style(),
+            )))]
         } else {
             self.matches
                 .iter()
                 .skip(start)
                 .take(MAX_ROWS)
                 .enumerate()
-                .map(|(row, file_match)| render_file_row(file_match, start + row == selected))
+                .map(|(row, file_match)| {
+                    render_file_row(file_match, start + row == selected, theme)
+                })
                 .collect::<Vec<_>>()
         };
-        let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(theme.panel_style())
+                .border_style(theme.border_style(true))
+                .title_style(theme.title_style(true)),
+        );
         Clear.render(area, buf);
         Widget::render(list, area, buf);
     }
@@ -152,12 +164,23 @@ impl FilePopup {
     }
 }
 
-fn render_file_row(file_match: &FileMatch, selected: bool) -> ListItem<'_> {
+fn render_file_row(file_match: &FileMatch, selected: bool, theme: &Theme) -> ListItem<'static> {
     let marker = if selected { "> " } else { "  " };
+    let row_style = if selected {
+        theme.selected_style()
+    } else {
+        theme.panel_style()
+    };
+    let path_style = if selected {
+        row_style
+    } else {
+        Style::default().fg(theme.blue).bg(theme.panel_bg)
+    };
     ListItem::new(Line::from(vec![
-        marker.into(),
-        file_match.path.as_str().cyan(),
+        Span::styled(marker, row_style),
+        Span::styled(file_match.path.clone(), path_style),
     ]))
+    .style(row_style)
 }
 
 #[cfg(test)]

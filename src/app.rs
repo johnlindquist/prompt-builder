@@ -30,7 +30,6 @@ use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
 use ratatui::prelude::*;
-use ratatui::style::Stylize;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Paragraph;
@@ -43,22 +42,32 @@ use crate::composer_input::ComposerInput;
 use crate::file_popup::FilePopup;
 use crate::file_popup::FilePopupAction;
 use crate::file_search;
+use crate::history::History;
 use crate::skill_popup::SkillPopup;
 use crate::skill_popup::SkillPopupAction;
 use crate::skills::Skill;
 use crate::slash_popup::SlashPopup;
 use crate::slash_popup::SlashPopupAction;
+use crate::target_popup::TargetPopup;
+use crate::target_popup::TargetPopupAction;
+use crate::targets::Target;
+use crate::theme::LoadedTheme;
+use crate::theme::Theme;
 
 pub enum AppExit {
-    Submit(SubmittedPrompt),
+    Submit(Box<SubmittedPrompt>),
     Cancel,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubmittedPrompt {
     pub prompt: String,
+    /// User-visible submitted Name without the automatic cwd prefix.
+    pub conversation_name: Option<String>,
+    /// Existing target/session name including the automatic cwd prefix.
     pub thread_name: Option<String>,
     pub toggled_argv: Vec<String>,
+    pub target: Option<Target>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -79,6 +88,7 @@ impl TemplateInfo {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     initial_prompt: String,
     initial_name: String,
@@ -86,6 +96,9 @@ pub fn run(
     cwd: PathBuf,
     template: Option<TemplateInfo>,
     launch_options: Vec<ToggleOption>,
+    targets: Vec<Target>,
+    initial_target: usize,
+    loaded_theme: LoadedTheme,
     debug_keys: Option<PathBuf>,
 ) -> anyhow::Result<AppExit> {
     let mut terminal = setup_terminal()?;
@@ -97,6 +110,9 @@ pub fn run(
         skills,
         header,
         launch_options,
+        targets,
+        initial_target,
+        loaded_theme,
         debug_keys,
     );
     match (result, restore_terminal()) {
@@ -106,6 +122,7 @@ pub fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     initial_prompt: String,
@@ -113,13 +130,26 @@ fn run_inner(
     skills: Vec<Skill>,
     header: HeaderInfo,
     mut launch_options: Vec<ToggleOption>,
+    mut targets: Vec<Target>,
+    initial_target: usize,
+    loaded_theme: LoadedTheme,
     debug_keys: Option<PathBuf>,
 ) -> anyhow::Result<AppExit> {
+    let theme = loaded_theme.theme;
+    let mut target_index = initial_target.min(targets.len().saturating_sub(1));
+    let mut target_popup: Option<TargetPopup> = None;
+    let mut pending_target_edit: Option<PendingTargetEdit> = None;
     let mut composer = ComposerInput::new();
+    if let Some(diagnostic) = loaded_theme.diagnostic {
+        composer.set_notice(diagnostic);
+    }
     composer.set_hint_items(vec![
         ("Tab", "field"),
         ("Enter", "send"),
         ("Shift+Enter", "newline"),
+        ("↑", "history"),
+        ("Ctrl+R", "search"),
+        ("Ctrl+G", "editor"),
         ("Ctrl+C", "quit"),
     ]);
     if !initial_prompt.is_empty() {
@@ -128,10 +158,14 @@ fn run_inner(
     let mut name_input = NameInput::new();
     name_input.set_text(&initial_name);
     let mut focus = initial_focus();
+    let mut skill_mentions = skills.iter().map(Skill::mention).collect::<Vec<_>>();
+    skill_mentions.sort_by_key(|mention| std::cmp::Reverse(mention.chars().count()));
     let mut skill_popup: Option<SkillPopup> = None;
     let mut file_popup: Option<FilePopup> = None;
     let mut slash_popup: Option<SlashPopup> = None;
     let mut cached_files: Option<Vec<String>> = None;
+    let mut history = History::default_paths();
+    let mut history_search: Option<HistorySearchState> = None;
     let mut key_debug = debug_keys.map(KeyDebug::create).transpose()?;
     if let Some(key_debug) = key_debug.as_mut() {
         key_debug.log_startup();
@@ -151,6 +185,11 @@ fn run_inner(
                     slash_popup: slash_popup.as_ref(),
                     header: &header,
                     launch_options: &launch_options,
+                    targets: &targets,
+                    target_index,
+                    target_popup: target_popup.as_ref(),
+                    theme: &theme,
+                    skill_mentions: &skill_mentions,
                 },
             )
         })?;
@@ -159,326 +198,670 @@ fn run_inner(
             continue;
         }
 
-        match event::read()? {
-            Event::Key(key) => {
-                let lines_before = composer_line_count(&composer);
-                if is_ctrl_c_press(key) {
-                    if handle_ctrl_c(&mut name_input, &mut composer, focus) {
+        // Drain every queued event before redrawing so large pastes and fast
+        // typing render once instead of once per character.
+        while event::poll(Duration::ZERO)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    let lines_before = composer_line_count(&composer);
+                    if matches!(
+                        key.kind,
+                        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                    ) {
+                        composer.clear_notice();
+                    }
+                    if target_popup.is_some() {
+                        let action = target_popup
+                            .as_mut()
+                            .map(|popup| popup.handle_key(key, targets.len()))
+                            .unwrap_or(TargetPopupAction::None);
+                        match action {
+                            TargetPopupAction::None => {}
+                            TargetPopupAction::Cancel => target_popup = None,
+                            TargetPopupAction::Use(index) => {
+                                target_index = index.min(targets.len().saturating_sub(1));
+                                target_popup = None;
+                            }
+                            TargetPopupAction::Reload => {
+                                if let Some(popup) = target_popup.as_mut() {
+                                    let previous = targets.get(target_index).cloned();
+                                    match crate::targets::load_targets() {
+                                        Ok(reloaded) => {
+                                            target_index = reselect_target_index(
+                                                previous.as_ref(),
+                                                target_index,
+                                                &reloaded,
+                                            );
+                                            targets = reloaded;
+                                            popup.set_selected(target_index, targets.len());
+                                            popup.set_notice("targets reloaded");
+                                            pending_target_edit = None;
+                                        }
+                                        Err(err) => popup.set_notice(format!("reload: {err:#}")),
+                                    }
+                                }
+                            }
+                            TargetPopupAction::EditDocument => {
+                                if let Some(popup) = target_popup.as_mut() {
+                                    edit_targets_document(
+                                        terminal,
+                                        popup,
+                                        &mut targets,
+                                        &mut target_index,
+                                        &mut pending_target_edit,
+                                    )?;
+                                }
+                            }
+                        }
                         log_key_debug(
                             &mut key_debug,
                             focus,
                             key,
-                            "app",
-                            "cancel",
-                            lines_before,
-                            composer_line_count(&composer),
-                        );
-                        return Ok(AppExit::Cancel);
-                    }
-                    file_popup = None;
-                    slash_popup = None;
-                    log_key_debug(
-                        &mut key_debug,
-                        focus,
-                        key,
-                        "app",
-                        "clear",
-                        lines_before,
-                        composer_line_count(&composer),
-                    );
-                    continue;
-                }
-                if let Some(popup) = skill_popup.as_mut() {
-                    match popup.handle_key(key, &skills) {
-                        SkillPopupAction::None => {
-                            log_key_debug(
-                                &mut key_debug,
-                                focus,
-                                key,
-                                "skill_popup",
-                                "handled",
-                                lines_before,
-                                composer_line_count(&composer),
-                            );
-                            continue;
-                        }
-                        SkillPopupAction::Cancel => {
-                            skill_popup = None;
-                            log_key_debug(
-                                &mut key_debug,
-                                focus,
-                                key,
-                                "skill_popup",
-                                "cancel",
-                                lines_before,
-                                composer_line_count(&composer),
-                            );
-                            continue;
-                        }
-                        SkillPopupAction::Insert(text) => {
-                            skill_popup = None;
-                            insert_text(&mut composer, &text);
-                            log_key_debug(
-                                &mut key_debug,
-                                focus,
-                                key,
-                                "skill_popup",
-                                "insert",
-                                lines_before,
-                                composer_line_count(&composer),
-                            );
-                            continue;
-                        }
-                        SkillPopupAction::Forward => {}
-                    }
-                }
-                if file_popup.is_some() {
-                    match handle_file_popup_key(&mut file_popup, &mut composer, key) {
-                        FileKeyOutcome::Handled => {
-                            log_key_debug(
-                                &mut key_debug,
-                                focus,
-                                key,
-                                "file_popup",
-                                "handled",
-                                lines_before,
-                                composer_line_count(&composer),
-                            );
-                            continue;
-                        }
-                        FileKeyOutcome::Forward => {}
-                    }
-                }
-                if slash_popup.is_some() {
-                    match handle_slash_popup_key(&mut slash_popup, &mut composer, key) {
-                        SlashKeyOutcome::Handled => {
-                            log_key_debug(
-                                &mut key_debug,
-                                focus,
-                                key,
-                                "slash_popup",
-                                "handled",
-                                lines_before,
-                                composer_line_count(&composer),
-                            );
-                            continue;
-                        }
-                        SlashKeyOutcome::Forward => {}
-                    }
-                }
-                if is_tab_press(key) {
-                    focus = focus.next(launch_options.len());
-                    log_key_debug(
-                        &mut key_debug,
-                        focus,
-                        key,
-                        "app",
-                        "focus_next",
-                        lines_before,
-                        composer_line_count(&composer),
-                    );
-                    continue;
-                }
-                if focus == FocusTarget::Name {
-                    file_popup = None;
-                    slash_popup = None;
-                    if is_plain_enter_press(key) {
-                        focus = FocusTarget::Prompt;
-                        log_key_debug(
-                            &mut key_debug,
-                            focus,
-                            key,
-                            "name",
-                            "focus_prompt",
+                            "target_popup",
+                            "handled",
                             lines_before,
                             composer_line_count(&composer),
                         );
                         continue;
                     }
-                    name_input.input(key);
-                    log_key_debug(
-                        &mut key_debug,
-                        focus,
-                        key,
-                        "name",
-                        "input",
-                        lines_before,
-                        composer_line_count(&composer),
-                    );
-                    continue;
-                }
-                if let FocusTarget::Options(index) = focus {
-                    match key.code {
-                        KeyCode::Char(' ')
-                            if matches!(
-                                key.kind,
-                                event::KeyEventKind::Press | event::KeyEventKind::Repeat
-                            ) =>
-                        {
-                            if let Some(option) = launch_options.get_mut(index) {
-                                option.enabled = !option.enabled;
+                    if let Some(search) = history_search.as_mut() {
+                        if !handle_search_key(search, &mut history, &mut composer, key) {
+                            history_search = None;
+                            composer.clear_title();
+                        }
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "history_search",
+                            "handled",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if is_ctrl_r_press(key) && focus == FocusTarget::Prompt {
+                        skill_popup = None;
+                        file_popup = None;
+                        slash_popup = None;
+                        let search = HistorySearchState::new(composer.submission_text());
+                        composer.set_title(search.title(true));
+                        history_search = Some(search);
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "history_search",
+                            "open",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if is_ctrl_g_press(key) && focus == FocusTarget::Prompt {
+                        skill_popup = None;
+                        file_popup = None;
+                        slash_popup = None;
+                        let seed = composer.submission_text();
+                        let edited = with_suspended_terminal(terminal, || {
+                            crate::external_editor::edit_text(&seed)
+                        })?;
+                        match edited {
+                            Ok(text) => composer.set_text_end(&text),
+                            Err(err) => composer.set_notice(format!("editor: {err}")),
+                        }
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "app",
+                            "external_editor",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if is_ctrl_d_press(key) && focus == FocusTarget::Prompt && composer.is_empty() {
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "app",
+                            "cancel_eof",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        return Ok(AppExit::Cancel);
+                    }
+                    if is_ctrl_c_press(key) {
+                        let draft = composer.submission_text();
+                        if handle_ctrl_c(&mut name_input, &mut composer, focus) {
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "app",
+                                "cancel",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            return Ok(AppExit::Cancel);
+                        }
+                        // A cleared draft stays recoverable via Up-arrow history,
+                        // matching Codex's Ctrl+C behavior.
+                        if composer.is_empty() && !draft.trim().is_empty() {
+                            history.record(&draft);
+                        }
+                        file_popup = None;
+                        slash_popup = None;
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "app",
+                            "clear",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if let Some(popup) = skill_popup.as_mut() {
+                        match popup.handle_key(key, &skills) {
+                            SkillPopupAction::None => {
+                                log_key_debug(
+                                    &mut key_debug,
+                                    focus,
+                                    key,
+                                    "skill_popup",
+                                    "handled",
+                                    lines_before,
+                                    composer_line_count(&composer),
+                                );
+                                continue;
+                            }
+                            SkillPopupAction::Cancel => {
+                                skill_popup = None;
+                                log_key_debug(
+                                    &mut key_debug,
+                                    focus,
+                                    key,
+                                    "skill_popup",
+                                    "cancel",
+                                    lines_before,
+                                    composer_line_count(&composer),
+                                );
+                                continue;
+                            }
+                            SkillPopupAction::Insert(text) => {
+                                skill_popup = None;
+                                insert_text(&mut composer, &text);
+                                log_key_debug(
+                                    &mut key_debug,
+                                    focus,
+                                    key,
+                                    "skill_popup",
+                                    "insert",
+                                    lines_before,
+                                    composer_line_count(&composer),
+                                );
+                                continue;
+                            }
+                            SkillPopupAction::Forward => {}
+                        }
+                    }
+                    if file_popup.is_some() {
+                        match handle_file_popup_key(&mut file_popup, &mut composer, key) {
+                            FileKeyOutcome::Handled => {
+                                log_key_debug(
+                                    &mut key_debug,
+                                    focus,
+                                    key,
+                                    "file_popup",
+                                    "handled",
+                                    lines_before,
+                                    composer_line_count(&composer),
+                                );
+                                continue;
+                            }
+                            FileKeyOutcome::Forward => {}
+                        }
+                    }
+                    if slash_popup.is_some() {
+                        match handle_slash_popup_key(&mut slash_popup, &mut composer, key) {
+                            SlashKeyOutcome::Handled => {
+                                log_key_debug(
+                                    &mut key_debug,
+                                    focus,
+                                    key,
+                                    "slash_popup",
+                                    "handled",
+                                    lines_before,
+                                    composer_line_count(&composer),
+                                );
+                                continue;
+                            }
+                            SlashKeyOutcome::Forward => {}
+                        }
+                    }
+                    if is_tab_press(key) {
+                        focus = focus.next(launch_options.len(), !targets.is_empty());
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "app",
+                            "focus_next",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if focus == FocusTarget::Name {
+                        file_popup = None;
+                        slash_popup = None;
+                        if is_plain_enter_press(key) {
+                            focus = FocusTarget::Prompt;
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "name",
+                                "focus_prompt",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            continue;
+                        }
+                        name_input.input(key);
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "name",
+                            "input",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if focus == FocusTarget::TargetSelect {
+                        if is_ctrl_g_press(key) {
+                            skill_popup = None;
+                            file_popup = None;
+                            slash_popup = None;
+                            target_popup = Some(TargetPopup::new(target_index, targets.len()));
+                            if let Some(popup) = target_popup.as_mut() {
+                                edit_targets_document(
+                                    terminal,
+                                    popup,
+                                    &mut targets,
+                                    &mut target_index,
+                                    &mut pending_target_edit,
+                                )?;
+                            }
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "target_select",
+                                "open_editor",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            continue;
+                        }
+                        if matches!(
+                            key.kind,
+                            event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                        ) {
+                            match key.code {
+                                KeyCode::Char(' ') | KeyCode::Right | KeyCode::Down => {
+                                    target_index =
+                                        next_target_index(target_index, targets.len(), 1);
+                                }
+                                KeyCode::Left | KeyCode::Up => {
+                                    target_index =
+                                        next_target_index(target_index, targets.len(), -1);
+                                }
+                                KeyCode::Enter => {
+                                    skill_popup = None;
+                                    file_popup = None;
+                                    slash_popup = None;
+                                    target_popup =
+                                        Some(TargetPopup::new(target_index, targets.len()));
+                                }
+                                _ => {}
                             }
                         }
-                        KeyCode::Enter
-                            if matches!(
-                                key.kind,
-                                event::KeyEventKind::Press | event::KeyEventKind::Repeat
-                            ) =>
-                        {
-                            focus = focus.next(launch_options.len());
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "target_select",
+                            "handled",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if let FocusTarget::Options(index) = focus {
+                        match key.code {
+                            KeyCode::Char(' ')
+                                if matches!(
+                                    key.kind,
+                                    event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                                ) =>
+                            {
+                                if let Some(option) = launch_options.get_mut(index) {
+                                    option.enabled = !option.enabled;
+                                }
+                            }
+                            KeyCode::Enter
+                                if matches!(
+                                    key.kind,
+                                    event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                                ) =>
+                            {
+                                focus = focus.next(launch_options.len(), !targets.is_empty());
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                    log_key_debug(
-                        &mut key_debug,
-                        focus,
-                        key,
-                        "options",
-                        "handled",
-                        lines_before,
-                        composer_line_count(&composer),
-                    );
-                    continue;
-                }
-                if key.code == KeyCode::Char('$')
-                    && matches!(
-                        key.kind,
-                        event::KeyEventKind::Press | event::KeyEventKind::Repeat
-                    )
-                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-                    && !skills.is_empty()
-                    && file_popup.is_none()
-                    && slash_popup.is_none()
-                {
-                    skill_popup = Some(SkillPopup::default());
-                    log_key_debug(
-                        &mut key_debug,
-                        focus,
-                        key,
-                        "app",
-                        "open_skill_popup",
-                        lines_before,
-                        composer_line_count(&composer),
-                    );
-                    continue;
-                }
-                match composer.input(key) {
-                    ComposerAction::Submitted(text) => {
                         log_key_debug(
                             &mut key_debug,
                             focus,
                             key,
-                            "composer",
-                            "submit",
+                            "options",
+                            "handled",
                             lines_before,
                             composer_line_count(&composer),
                         );
-                        return Ok(AppExit::Submit(SubmittedPrompt {
-                            prompt: text,
-                            thread_name: prefixed_thread_name(
-                                name_input.text(),
-                                &cwd_name_prefix(&header.cwd),
-                            ),
-                            toggled_argv: enabled_option_argv(&launch_options),
-                        }));
+                        continue;
                     }
-                    ComposerAction::None => {
+                    if key.code == KeyCode::Char('$')
+                        && matches!(
+                            key.kind,
+                            event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                        )
+                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                        && !skills.is_empty()
+                        && file_popup.is_none()
+                        && slash_popup.is_none()
+                    {
+                        skill_popup = Some(SkillPopup::default());
                         log_key_debug(
                             &mut key_debug,
                             focus,
                             key,
-                            "composer",
-                            composer_action_label(lines_before, composer_line_count(&composer)),
+                            "app",
+                            "open_skill_popup",
                             lines_before,
                             composer_line_count(&composer),
                         );
+                        continue;
                     }
-                }
-                sync_file_popup(
-                    &mut file_popup,
-                    &composer,
-                    &mut cached_files,
-                    &header.cwd_path,
-                );
-                sync_slash_popup(&mut slash_popup, &composer);
-            }
-            Event::Paste(text) => {
-                let lines_before = composer_line_count(&composer);
-                skill_popup = None;
-                file_popup = None;
-                slash_popup = None;
-                match focus {
-                    FocusTarget::Name => name_input.handle_paste(&text),
-                    FocusTarget::Prompt => {
-                        composer.handle_paste(text);
-                        sync_file_popup(
-                            &mut file_popup,
-                            &composer,
-                            &mut cached_files,
-                            &header.cwd_path,
-                        );
-                        sync_slash_popup(&mut slash_popup, &composer);
+                    if skill_popup.is_none() && file_popup.is_none() && slash_popup.is_none() {
+                        if let Some(text) = handle_history_key(&mut history, &composer, key) {
+                            composer.set_text_end(&text);
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "history",
+                                "recall",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            continue;
+                        }
                     }
-                    FocusTarget::Options(_) => {}
+                    match composer.input(key) {
+                        ComposerAction::Submitted(text) => {
+                            history.record(&text);
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "composer",
+                                "submit",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            let conversation_name = submitted_conversation_name(name_input.text());
+                            let thread_name = conversation_name.as_deref().and_then(|name| {
+                                prefixed_thread_name(name, &cwd_name_prefix(&header.cwd))
+                            });
+                            return Ok(AppExit::Submit(Box::new(SubmittedPrompt {
+                                prompt: text,
+                                conversation_name,
+                                thread_name,
+                                toggled_argv: enabled_option_argv(&launch_options),
+                                target: targets.get(target_index).cloned(),
+                            })));
+                        }
+                        ComposerAction::None => {
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "composer",
+                                composer_action_label(lines_before, composer_line_count(&composer)),
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                        }
+                    }
+                    sync_file_popup(
+                        &mut file_popup,
+                        &composer,
+                        &mut cached_files,
+                        &header.cwd_path,
+                    );
+                    sync_slash_popup(&mut slash_popup, &composer);
                 }
-                log_event_debug(
-                    &mut key_debug,
-                    "paste",
-                    focus,
-                    "event",
-                    "paste",
-                    lines_before,
-                    composer_line_count(&composer),
-                );
+                Event::Paste(text) => {
+                    if target_popup.is_some() {
+                        continue;
+                    }
+                    let lines_before = composer_line_count(&composer);
+                    skill_popup = None;
+                    file_popup = None;
+                    slash_popup = None;
+                    match focus {
+                        FocusTarget::Name => name_input.handle_paste(&text),
+                        FocusTarget::Prompt => {
+                            composer.handle_paste(text);
+                            sync_file_popup(
+                                &mut file_popup,
+                                &composer,
+                                &mut cached_files,
+                                &header.cwd_path,
+                            );
+                            sync_slash_popup(&mut slash_popup, &composer);
+                        }
+                        FocusTarget::TargetSelect | FocusTarget::Options(_) => {}
+                    }
+                    log_event_debug(
+                        &mut key_debug,
+                        "paste",
+                        focus,
+                        "event",
+                        "paste",
+                        lines_before,
+                        composer_line_count(&composer),
+                    );
+                }
+                Event::Resize(_, _) => {
+                    let lines = composer_line_count(&composer);
+                    log_event_debug(
+                        &mut key_debug,
+                        "resize",
+                        focus,
+                        "event",
+                        "resize",
+                        lines,
+                        lines,
+                    );
+                }
+                Event::FocusGained => {
+                    let lines = composer_line_count(&composer);
+                    log_event_debug(
+                        &mut key_debug,
+                        "focus_gained",
+                        focus,
+                        "event",
+                        "focus_gained",
+                        lines,
+                        lines,
+                    );
+                }
+                Event::FocusLost => {
+                    let lines = composer_line_count(&composer);
+                    log_event_debug(
+                        &mut key_debug,
+                        "focus_lost",
+                        focus,
+                        "event",
+                        "focus_lost",
+                        lines,
+                        lines,
+                    );
+                }
+                Event::Mouse(_) => {
+                    let lines = composer_line_count(&composer);
+                    log_event_debug(
+                        &mut key_debug,
+                        "mouse",
+                        focus,
+                        "event",
+                        "mouse",
+                        lines,
+                        lines,
+                    );
+                }
             }
-            Event::Resize(_, _) => {
-                let lines = composer_line_count(&composer);
-                log_event_debug(
-                    &mut key_debug,
-                    "resize",
-                    focus,
-                    "event",
-                    "resize",
-                    lines,
-                    lines,
-                );
+        }
+    }
+}
+
+/// Bash-style reverse-i-search over prompt history, active while Some.
+struct HistorySearchState {
+    query: String,
+    match_index: Option<usize>,
+    draft: String,
+}
+
+impl HistorySearchState {
+    fn new(draft: String) -> Self {
+        Self {
+            query: String::new(),
+            match_index: None,
+            draft,
+        }
+    }
+
+    fn title(&self, found: bool) -> String {
+        if found || self.query.is_empty() {
+            format!("Search history: {}", self.query)
+        } else {
+            format!("Search history (no match): {}", self.query)
+        }
+    }
+}
+
+/// Handles one key while reverse search is active. Returns false when the
+/// search mode should exit.
+fn handle_search_key(
+    search: &mut HistorySearchState,
+    history: &mut History,
+    composer: &mut ComposerInput,
+    key: KeyEvent,
+) -> bool {
+    if !matches!(
+        key.kind,
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+    ) {
+        return true;
+    }
+
+    let key = normalize_key_for_binding(key);
+    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            composer.set_text_end(&search.draft);
+            return false;
+        }
+        KeyCode::Char('c') if is_ctrl => {
+            composer.set_text_end(&search.draft);
+            return false;
+        }
+        KeyCode::Enter => return false,
+        KeyCode::Char('r') if is_ctrl => {
+            if let Some((index, text)) = history.search_older(&search.query, search.match_index) {
+                search.match_index = Some(index);
+                composer.set_text_end(&text);
+                composer.set_title(search.title(true));
+            } else {
+                composer.set_title(search.title(search.match_index.is_some()));
             }
-            Event::FocusGained => {
-                let lines = composer_line_count(&composer);
-                log_event_debug(
-                    &mut key_debug,
-                    "focus_gained",
-                    focus,
-                    "event",
-                    "focus_gained",
-                    lines,
-                    lines,
-                );
-            }
-            Event::FocusLost => {
-                let lines = composer_line_count(&composer);
-                log_event_debug(
-                    &mut key_debug,
-                    "focus_lost",
-                    focus,
-                    "event",
-                    "focus_lost",
-                    lines,
-                    lines,
-                );
-            }
-            Event::Mouse(_) => {
-                let lines = composer_line_count(&composer);
-                log_event_debug(
-                    &mut key_debug,
-                    "mouse",
-                    focus,
-                    "event",
-                    "mouse",
-                    lines,
-                    lines,
-                );
-            }
+        }
+        KeyCode::Backspace => {
+            search.query.pop();
+            apply_search_from_newest(search, history, composer);
+        }
+        KeyCode::Char(ch) if !is_ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            search.query.push(ch);
+            apply_search_from_newest(search, history, composer);
+        }
+        _ => {}
+    }
+    true
+}
+
+fn apply_search_from_newest(
+    search: &mut HistorySearchState,
+    history: &mut History,
+    composer: &mut ComposerInput,
+) {
+    match history.search_older(&search.query, None) {
+        Some((index, text)) => {
+            search.match_index = Some(index);
+            composer.set_text_end(&text);
+            composer.set_title(search.title(true));
+        }
+        None => {
+            search.match_index = None;
+            composer.set_title(search.title(false));
+        }
+    }
+}
+
+/// Routes Up/Down to cross-session history when the composer is empty or a
+/// recall is already in progress. Any other key detaches the recalled text so
+/// it can be edited as a normal draft.
+fn handle_history_key(
+    history: &mut History,
+    composer: &ComposerInput,
+    key: KeyEvent,
+) -> Option<String> {
+    if !matches!(
+        key.kind,
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+    ) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Up
+            if key.modifiers.is_empty() && (composer.is_empty() || history.is_browsing()) =>
+        {
+            history.navigate_up(&composer.text())
+        }
+        KeyCode::Down if key.modifiers.is_empty() && history.is_browsing() => {
+            history.navigate_down()
+        }
+        _ => {
+            history.stop_browsing();
+            None
         }
     }
 }
@@ -610,6 +993,33 @@ fn is_ctrl_c_press(key: KeyEvent) -> bool {
         key.kind,
         event::KeyEventKind::Press | event::KeyEventKind::Repeat
     ) && key.code == KeyCode::Char('c')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_ctrl_r_press(key: KeyEvent) -> bool {
+    let key = normalize_key_for_binding(key);
+    matches!(
+        key.kind,
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+    ) && key.code == KeyCode::Char('r')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_ctrl_d_press(key: KeyEvent) -> bool {
+    let key = normalize_key_for_binding(key);
+    matches!(
+        key.kind,
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+    ) && key.code == KeyCode::Char('d')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_ctrl_g_press(key: KeyEvent) -> bool {
+    let key = normalize_key_for_binding(key);
+    matches!(
+        key.kind,
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+    ) && key.code == KeyCode::Char('g')
         && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
@@ -803,14 +1213,16 @@ fn handle_ctrl_c(
     }
 }
 
-pub fn prefixed_thread_name(raw: &str, cwd: &str) -> Option<String> {
+pub(crate) fn submitted_conversation_name(raw: &str) -> Option<String> {
     let name = raw.trim();
-    if name.is_empty() {
-        return None;
-    }
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+pub fn prefixed_thread_name(raw: &str, cwd: &str) -> Option<String> {
+    let name = submitted_conversation_name(raw)?;
     let prefix = format!("{cwd}:");
     if name.starts_with(&prefix) {
-        Some(name.to_string())
+        Some(name)
     } else {
         Some(format!("{prefix}{name}"))
     }
@@ -828,23 +1240,145 @@ fn cwd_name_prefix(cwd: &str) -> String {
 enum FocusTarget {
     Name,
     Prompt,
+    TargetSelect,
     Options(usize),
 }
 
 impl FocusTarget {
-    fn next(self, option_count: usize) -> Self {
+    fn next(self, option_count: usize, has_target_select: bool) -> Self {
         match self {
             Self::Name => Self::Prompt,
+            Self::Prompt if has_target_select => Self::TargetSelect,
             Self::Prompt if option_count == 0 => Self::Name,
             Self::Prompt => Self::Options(0),
+            Self::TargetSelect if option_count == 0 => Self::Name,
+            Self::TargetSelect => Self::Options(0),
             Self::Options(index) if index + 1 < option_count => Self::Options(index + 1),
             Self::Options(_) => Self::Name,
         }
     }
 }
 
+fn next_target_index(current: usize, count: usize, step: isize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let count = count as isize;
+    (current as isize + step).rem_euclid(count) as usize
+}
+
+type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// Runs `operation` with the terminal restored to normal mode, then puts the
+/// TUI back regardless of the operation's outcome.
+fn with_suspended_terminal<T>(
+    terminal: &mut AppTerminal,
+    operation: impl FnOnce() -> T,
+) -> anyhow::Result<T> {
+    restore_terminal()?;
+    let result = operation();
+    *terminal = setup_terminal()?;
+    terminal.clear()?;
+    Ok(result)
+}
+
+/// An edited targets document that failed to commit; kept so reopening the
+/// editor shows the user's text instead of discarding it.
+struct PendingTargetEdit {
+    snapshot: crate::targets::TargetEditSnapshot,
+    draft: String,
+}
+
+fn edit_targets_document(
+    terminal: &mut AppTerminal,
+    popup: &mut TargetPopup,
+    targets: &mut Vec<Target>,
+    target_index: &mut usize,
+    pending_target_edit: &mut Option<PendingTargetEdit>,
+) -> anyhow::Result<()> {
+    let mut edit = match pending_target_edit.take() {
+        Some(edit) => edit,
+        None => match crate::targets::begin_edit() {
+            Ok(snapshot) => PendingTargetEdit {
+                draft: snapshot.seed().to_string(),
+                snapshot,
+            },
+            Err(err) => {
+                popup.set_notice(format!("targets: {err:#}"));
+                return Ok(());
+            }
+        },
+    };
+    let previous = targets.get(*target_index).cloned();
+    let edited =
+        with_suspended_terminal(terminal, || crate::external_editor::edit_toml(&edit.draft))?;
+    match edited {
+        Err(err) => {
+            popup.set_notice(format!("editor: {err:#}"));
+            *pending_target_edit = Some(edit);
+        }
+        Ok(text) => {
+            edit.draft = text;
+            match crate::targets::commit_edit(&edit.snapshot, &edit.draft) {
+                Ok(updated) => {
+                    *target_index =
+                        reselect_target_index(previous.as_ref(), *target_index, &updated);
+                    *targets = updated;
+                    popup.set_selected(*target_index, targets.len());
+                    popup.set_notice("targets saved");
+                }
+                Err(err) => {
+                    popup.set_notice(format!("targets: {err:#}"));
+                    *pending_target_edit = Some(edit);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Picks the selection after the target list changed: same name first, then a
+/// name-only rename (same settings), then the clamped previous position.
+fn reselect_target_index(
+    previous: Option<&Target>,
+    previous_index: usize,
+    updated: &[Target],
+) -> usize {
+    if updated.is_empty() {
+        return 0;
+    }
+    let Some(previous) = previous else {
+        return previous_index.min(updated.len() - 1);
+    };
+    if let Some(index) = updated
+        .iter()
+        .position(|candidate| candidate.name == previous.name)
+    {
+        return index;
+    }
+    if let Some((index, _)) = updated
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| same_target_except_name(candidate, previous))
+        .min_by_key(|(index, _)| index.abs_diff(previous_index))
+    {
+        return index;
+    }
+    previous_index.min(updated.len() - 1)
+}
+
+fn same_target_except_name(left: &Target, right: &Target) -> bool {
+    left.kind == right.kind
+        && left.bin == right.bin
+        && left.env == right.env
+        && left.profile == right.profile
+        && left.model == right.model
+        && left.config == right.config
+        && left.args == right.args
+}
+
 fn initial_focus() -> FocusTarget {
-    FocusTarget::Prompt
+    FocusTarget::Name
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -908,16 +1442,21 @@ impl NameInput {
         }
     }
 
-    fn render_ref(&self, area: Rect, focused: bool, buf: &mut Buffer) {
+    fn render_ref(&self, area: Rect, focused: bool, theme: &Theme, buf: &mut Buffer) {
         let title = if focused { "Name *" } else { "Name" };
-        let block = Block::default().borders(Borders::ALL).title(title);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .style(theme.panel_style())
+            .border_style(theme.border_style(focused))
+            .title_style(theme.title_style(focused));
         let inner = block.inner(area);
         block.render(area, buf);
         if inner.width == 0 || inner.height == 0 {
             return;
         }
 
-        clear_area(inner, buf);
+        clear_area(inner, theme.panel_style(), buf);
         let content_width = inner.width as usize;
         if self.text.is_empty() {
             buf.set_stringn(
@@ -925,7 +1464,7 @@ impl NameInput {
                 inner.y,
                 "Optional conversation name",
                 content_width,
-                Style::default().dim(),
+                theme.muted_style(),
             );
             return;
         }
@@ -938,7 +1477,7 @@ impl NameInput {
             .skip(first_visible)
             .take(content_width)
             .collect::<String>();
-        buf.set_stringn(inner.x, inner.y, visible, content_width, Style::default());
+        buf.set_stringn(inner.x, inner.y, visible, content_width, theme.text_style());
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
@@ -1009,11 +1548,10 @@ fn single_line_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn clear_area(area: Rect, buf: &mut Buffer) {
+fn clear_area(area: Rect, style: Style, buf: &mut Buffer) {
+    let blank = " ".repeat(area.width as usize);
     for y in area.y..area.bottom() {
-        for x in area.x..area.right() {
-            buf[(x, y)].reset();
-        }
+        buf.set_string(area.x, y, &blank, style);
     }
 }
 
@@ -1027,6 +1565,11 @@ struct DrawState<'a> {
     slash_popup: Option<&'a SlashPopup>,
     header: &'a HeaderInfo,
     launch_options: &'a [ToggleOption],
+    targets: &'a [Target],
+    target_index: usize,
+    target_popup: Option<&'a TargetPopup>,
+    theme: &'a Theme,
+    skill_mentions: &'a [String],
 }
 
 fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
@@ -1040,19 +1583,35 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
         slash_popup,
         header,
         launch_options,
+        targets,
+        target_index,
+        target_popup,
+        theme,
+        skill_mentions,
     } = state;
     let area = frame.area();
+    frame.render_widget(Block::default().style(theme.root_style()), area);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(header.height()), Constraint::Min(1)])
         .split(area);
 
     frame.render_widget(
-        Paragraph::new(header.lines()).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(header.lines(theme)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(theme.panel_style())
+                .border_style(theme.border_style(false)),
+        ),
         layout[0],
     );
 
-    let options_height = if launch_options.is_empty() { 0 } else { 1 };
+    let has_target_select = !targets.is_empty();
+    let options_height = if launch_options.is_empty() && !has_target_select {
+        0
+    } else {
+        1
+    };
     let fixed_input_height = 3 + options_height;
     let composer_height = composer.desired_height(layout[1].width).clamp(
         3,
@@ -1071,33 +1630,57 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
     name_input.render_ref(
         input_rows[1],
         focus == FocusTarget::Name,
+        theme,
         frame.buffer_mut(),
     );
-    composer.render_ref(input_rows[2], frame.buffer_mut());
+    composer.render_ref(
+        input_rows[2],
+        focus == FocusTarget::Prompt,
+        theme,
+        skill_mentions,
+        frame.buffer_mut(),
+    );
     if let Some(popup) = skill_popup {
         let popup_area = popup_area(input_rows[2], popup, skills);
-        popup.render(popup_area, frame.buffer_mut(), skills);
+        popup.render(popup_area, frame.buffer_mut(), skills, theme);
     }
     if let Some(popup) = file_popup {
         let popup_area = file_popup_area(input_rows[2], popup);
-        popup.render(popup_area, frame.buffer_mut());
+        popup.render(popup_area, frame.buffer_mut(), theme);
     }
     if let Some(popup) = slash_popup {
         let popup_area = slash_popup_area(input_rows[2], popup);
-        popup.render(popup_area, frame.buffer_mut());
+        popup.render(popup_area, frame.buffer_mut(), theme);
     }
     if options_height > 0 {
+        let target_select = if has_target_select {
+            targets
+                .get(target_index)
+                .map(|target| (target.name.as_str(), focus == FocusTarget::TargetSelect))
+        } else {
+            None
+        };
         render_launch_options(
             input_rows[3],
+            target_select,
             launch_options,
             focused_option_index(focus),
+            theme,
             frame.buffer_mut(),
         );
     }
-    let cursor = match focus {
-        FocusTarget::Name => name_input.cursor_pos(input_rows[1]),
-        FocusTarget::Prompt => composer.cursor_pos(input_rows[2]),
-        FocusTarget::Options(_) => None,
+    if let Some(popup) = target_popup {
+        let popup_area = target_popup_area(area, popup, targets);
+        popup.render(popup_area, frame.buffer_mut(), targets, target_index, theme);
+    }
+    let cursor = if target_popup.is_some() {
+        None
+    } else {
+        match focus {
+            FocusTarget::Name => name_input.cursor_pos(input_rows[1]),
+            FocusTarget::Prompt => composer.cursor_pos(input_rows[2]),
+            FocusTarget::TargetSelect | FocusTarget::Options(_) => None,
+        }
     };
     if let Some((x, y)) = cursor {
         frame.set_cursor_position((x, y));
@@ -1113,16 +1696,34 @@ fn focused_option_index(focus: FocusTarget) -> Option<usize> {
 
 fn render_launch_options(
     area: Rect,
+    target_select: Option<(&str, bool)>,
     options: &[ToggleOption],
     focused_index: Option<usize>,
+    theme: &Theme,
     buf: &mut Buffer,
 ) {
-    clear_area(area, buf);
-    if area.width == 0 || area.height == 0 || options.is_empty() {
+    clear_area(area, theme.panel_style(), buf);
+    if area.width == 0 || area.height == 0 || (options.is_empty() && target_select.is_none()) {
         return;
     }
 
-    let mut spans = vec!["Options ".dim()];
+    let mut spans = Vec::new();
+    if let Some((name, focused)) = target_select {
+        spans.push(Span::styled("Target ", theme.muted_style()));
+        let label = format!("‹{name}›");
+        if focused {
+            spans.push(Span::styled(label, theme.selected_style()));
+            spans.push(Span::styled(" Enter manage", theme.muted_style()));
+        } else {
+            spans.push(Span::styled(label, theme.text_style()));
+        }
+        if !options.is_empty() {
+            spans.push("  ".into());
+        }
+    }
+    if !options.is_empty() {
+        spans.push(Span::styled("Options ", theme.muted_style()));
+    }
     for (index, option) in options.iter().enumerate() {
         if index > 0 {
             spans.push("  ".into());
@@ -1130,11 +1731,11 @@ fn render_launch_options(
         let checkbox = if option.enabled { "[x] " } else { "[ ] " };
         let label = format!("{checkbox}{}", option.label);
         if focused_index == Some(index) {
-            spans.push(label.bold());
+            spans.push(Span::styled(label, theme.selected_style()));
         } else if option.enabled {
-            spans.push(label.into());
+            spans.push(Span::styled(label, theme.text_style()));
         } else {
-            spans.push(label.dim());
+            spans.push(Span::styled(label, theme.muted_style()));
         }
     }
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
@@ -1155,6 +1756,20 @@ fn popup_area(composer_area: Rect, popup: &SkillPopup, skills: &[Skill]) -> Rect
         .max(3);
     let x = composer_area.x.saturating_add(1);
     let y = composer_area.y.saturating_sub(height);
+    Rect::new(x, y, width, height)
+}
+
+fn target_popup_area(frame_area: Rect, popup: &TargetPopup, targets: &[Target]) -> Rect {
+    // Never exceed the frame: tiny terminals get a tiny (or empty) popup
+    // instead of an out-of-bounds render.
+    let width = frame_area
+        .width
+        .saturating_sub(4)
+        .clamp(24, 72)
+        .min(frame_area.width);
+    let height = popup.required_height(targets).max(4).min(frame_area.height);
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
     Rect::new(x, y, width, height)
 }
 
@@ -1205,17 +1820,23 @@ impl HeaderInfo {
         }
     }
 
-    fn lines(&self) -> Vec<Line<'_>> {
-        let mut lines = vec![Line::from(self.cwd.clone())];
+    fn lines(&self, theme: &Theme) -> Vec<Line<'_>> {
+        let mut lines = vec![Line::from(Span::styled(
+            self.cwd.clone(),
+            theme.text_style().add_modifier(Modifier::BOLD),
+        ))];
         if let Some(template) = &self.template {
-            lines.push(template_line(template));
+            lines.push(template_line(template, theme));
         }
-        lines.push(Line::from(vec!["git  ".into(), self.git.clone().into()]));
+        lines.push(Line::from(vec![
+            Span::styled("git  ", theme.muted_style()),
+            Span::styled(self.git.clone(), theme.secondary_style()),
+        ]));
         lines
     }
 }
 
-fn template_line(template: &TemplateInfo) -> Line<'_> {
+fn template_line<'a>(template: &'a TemplateInfo, theme: &Theme) -> Line<'a> {
     let label = template
         .label
         .as_deref()
@@ -1229,8 +1850,11 @@ fn template_line(template: &TemplateInfo) -> Line<'_> {
         .filter(|description| !description.is_empty())
         .unwrap_or_default();
     Line::from(vec![
-        format!("{label}: ").bold(),
-        description.to_string().into(),
+        Span::styled(
+            format!("{label}: "),
+            theme.title_style(true).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(description.to_string(), theme.text_style()),
     ])
 }
 
@@ -1612,6 +2236,117 @@ mod tests {
     }
 
     #[test]
+    fn history_up_recalls_only_into_empty_composer() {
+        let dir =
+            std::env::temp_dir().join(format!("prompt-builder-app-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("history.jsonl");
+        std::fs::write(&path, "{\"ts\":1,\"text\":\"old prompt\"}\n").expect("write history");
+        let mut history = History::new(None, vec![path]);
+
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("draft");
+        assert_eq!(
+            handle_history_key(&mut history, &composer, KeyEvent::from(KeyCode::Up)),
+            None
+        );
+
+        let empty = ComposerInput::new();
+        assert_eq!(
+            handle_history_key(&mut history, &empty, KeyEvent::from(KeyCode::Up)),
+            Some("old prompt".to_string())
+        );
+        // Typing detaches the recalled entry from history browsing.
+        assert_eq!(
+            handle_history_key(&mut history, &empty, KeyEvent::from(KeyCode::Char('x'))),
+            None
+        );
+        assert!(!history.is_browsing());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reverse_search_recalls_matches_and_esc_restores_draft() {
+        let dir =
+            std::env::temp_dir().join(format!("prompt-builder-app-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("history.jsonl");
+        std::fs::write(
+            &path,
+            "{\"ts\":1,\"text\":\"fix parser\"}\n{\"ts\":2,\"text\":\"add tests\"}\n{\"ts\":3,\"text\":\"fix bug\"}\n",
+        )
+        .expect("write history");
+        let mut history = History::new(None, vec![path]);
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("draft");
+        let mut search = HistorySearchState::new(composer.submission_text());
+
+        // Typing "fix" recalls the newest match.
+        for ch in ['f', 'i', 'x'] {
+            assert!(handle_search_key(
+                &mut search,
+                &mut history,
+                &mut composer,
+                KeyEvent::from(KeyCode::Char(ch)),
+            ));
+        }
+        assert_eq!(composer.text(), "fix bug");
+
+        // Ctrl+R steps to the older match.
+        assert!(handle_search_key(
+            &mut search,
+            &mut history,
+            &mut composer,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        ));
+        assert_eq!(composer.text(), "fix parser");
+
+        // Esc restores the original draft and exits search.
+        assert!(!handle_search_key(
+            &mut search,
+            &mut history,
+            &mut composer,
+            KeyEvent::from(KeyCode::Esc),
+        ));
+        assert_eq!(composer.text(), "draft");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reverse_search_enter_accepts_current_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "prompt-builder-app-search-accept-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("history.jsonl");
+        std::fs::write(&path, "{\"ts\":1,\"text\":\"ship it\"}\n").expect("write history");
+        let mut history = History::new(None, vec![path]);
+        let mut composer = ComposerInput::new();
+        let mut search = HistorySearchState::new(String::new());
+
+        for ch in ['s', 'h'] {
+            handle_search_key(
+                &mut search,
+                &mut history,
+                &mut composer,
+                KeyEvent::from(KeyCode::Char(ch)),
+            );
+        }
+        assert!(!handle_search_key(
+            &mut search,
+            &mut history,
+            &mut composer,
+            KeyEvent::from(KeyCode::Enter),
+        ));
+        assert_eq!(composer.text(), "ship it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn ctrl_c_release_is_ignored() {
         let release = KeyEvent::new_with_kind(
             KeyCode::Char('c'),
@@ -1671,21 +2406,135 @@ mod tests {
 
     #[test]
     fn focus_cycles_through_options_when_present() {
-        assert_eq!(FocusTarget::Name.next(2), FocusTarget::Prompt);
-        assert_eq!(FocusTarget::Prompt.next(2), FocusTarget::Options(0));
-        assert_eq!(FocusTarget::Options(0).next(2), FocusTarget::Options(1));
-        assert_eq!(FocusTarget::Options(1).next(2), FocusTarget::Name);
+        assert_eq!(FocusTarget::Name.next(2, false), FocusTarget::Prompt);
+        assert_eq!(FocusTarget::Prompt.next(2, false), FocusTarget::Options(0));
+        assert_eq!(
+            FocusTarget::Options(0).next(2, false),
+            FocusTarget::Options(1)
+        );
+        assert_eq!(FocusTarget::Options(1).next(2, false), FocusTarget::Name);
     }
 
     #[test]
-    fn initial_focus_starts_in_prompt_like_codex() {
-        assert_eq!(initial_focus(), FocusTarget::Prompt);
+    fn focus_cycles_through_target_selector_when_present() {
+        assert_eq!(FocusTarget::Prompt.next(0, true), FocusTarget::TargetSelect);
+        assert_eq!(FocusTarget::TargetSelect.next(0, true), FocusTarget::Name);
+        assert_eq!(
+            FocusTarget::TargetSelect.next(2, true),
+            FocusTarget::Options(0)
+        );
+        assert_eq!(FocusTarget::Options(1).next(2, true), FocusTarget::Name);
+    }
+
+    #[test]
+    fn options_row_renders_target_selector_before_options() {
+        let area = Rect::new(0, 0, 60, 1);
+        let mut buf = Buffer::empty(area);
+        let options = vec![ToggleOption {
+            label: "compact".to_string(),
+            argv: vec!["--compact".to_string()],
+            enabled: true,
+        }];
+
+        render_launch_options(
+            area,
+            Some(("claude", true)),
+            &options,
+            None,
+            &Theme::catppuccin(),
+            &mut buf,
+        );
+
+        let row: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(row.starts_with("Target ‹claude› Enter manage  Options [x] compact"));
+    }
+
+    #[test]
+    fn options_row_renders_selector_without_options() {
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+
+        render_launch_options(
+            area,
+            Some(("egghead", false)),
+            &[],
+            None,
+            &Theme::catppuccin(),
+            &mut buf,
+        );
+
+        let row: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(row.starts_with("Target ‹egghead›"));
+        assert!(!row.contains("Options"));
+    }
+
+    #[test]
+    fn target_index_cycles_and_wraps_in_both_directions() {
+        assert_eq!(next_target_index(0, 3, 1), 1);
+        assert_eq!(next_target_index(2, 3, 1), 0);
+        assert_eq!(next_target_index(0, 3, -1), 2);
+        assert_eq!(next_target_index(0, 0, 1), 0);
+    }
+
+    fn named_target(name: &str) -> Target {
+        Target {
+            name: name.to_string(),
+            ..Target::default()
+        }
+    }
+
+    #[test]
+    fn reselect_prefers_same_name_after_reorder() {
+        let previous = named_target("b");
+        let updated = vec![named_target("b"), named_target("a")];
+
+        assert_eq!(reselect_target_index(Some(&previous), 1, &updated), 0);
+    }
+
+    #[test]
+    fn reselect_follows_name_only_rename() {
+        let mut previous = named_target("old");
+        previous.model = Some("gpt-5.5".to_string());
+        let mut renamed = named_target("new");
+        renamed.model = Some("gpt-5.5".to_string());
+        let updated = vec![named_target("other"), renamed];
+
+        assert_eq!(reselect_target_index(Some(&previous), 0, &updated), 1);
+    }
+
+    #[test]
+    fn reselect_uses_successor_after_middle_remove() {
+        let mut previous = named_target("gone");
+        previous.model = Some("unique".to_string());
+        let updated = vec![named_target("a"), named_target("c")];
+
+        assert_eq!(reselect_target_index(Some(&previous), 1, &updated), 1);
+    }
+
+    #[test]
+    fn reselect_clamps_after_last_remove_and_empty_input() {
+        let mut previous = named_target("gone");
+        previous.model = Some("unique".to_string());
+        let updated = vec![named_target("a"), named_target("b")];
+
+        assert_eq!(reselect_target_index(Some(&previous), 5, &updated), 1);
+        assert_eq!(reselect_target_index(Some(&previous), 5, &[]), 0);
+        assert_eq!(reselect_target_index(None, 3, &updated), 1);
+    }
+
+    #[test]
+    fn initial_focus_starts_in_name_field() {
+        assert_eq!(initial_focus(), FocusTarget::Name);
     }
 
     #[test]
     fn focus_cycle_skips_options_when_none_are_present() {
-        assert_eq!(FocusTarget::Name.next(0), FocusTarget::Prompt);
-        assert_eq!(FocusTarget::Prompt.next(0), FocusTarget::Name);
+        assert_eq!(FocusTarget::Name.next(0, false), FocusTarget::Prompt);
+        assert_eq!(FocusTarget::Prompt.next(0, false), FocusTarget::Name);
     }
 
     #[test]
@@ -1738,6 +2587,19 @@ mod tests {
         input.handle_paste("Fix\nthis\tthing");
 
         assert_eq!(input.text(), "Fix this thing");
+    }
+
+    #[test]
+    fn submitted_conversation_name_trims_outer_whitespace_and_skips_blank() {
+        assert_eq!(submitted_conversation_name(" \t "), None);
+        assert_eq!(
+            submitted_conversation_name(" Fix parser "),
+            Some("Fix parser".to_string())
+        );
+        assert_eq!(
+            submitted_conversation_name("Fix parser: phase 2"),
+            Some("Fix parser: phase 2".to_string())
+        );
     }
 
     #[test]

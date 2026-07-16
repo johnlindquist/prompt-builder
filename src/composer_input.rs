@@ -5,7 +5,6 @@ use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::prelude::*;
-use ratatui::style::Stylize;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Widget;
@@ -15,9 +14,60 @@ use tui_textarea::TextArea;
 use crate::file_search;
 use crate::file_search::AtToken;
 use crate::slash_commands;
+use crate::theme::Theme;
+
+use std::time::Duration;
+use std::time::Instant;
 
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 const MAX_COMPOSER_HEIGHT: u16 = 16;
+
+// Mirrors Codex's paste_burst.rs heuristics: characters arriving faster than a
+// human can type are treated as a paste, and Enter inside that window inserts
+// a newline instead of submitting a half-pasted prompt. Only matters when the
+// terminal lacks bracketed paste.
+const PASTE_BURST_MIN_CHARS: usize = 3;
+const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);
+const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
+
+#[derive(Debug, Default)]
+struct PasteBurst {
+    last_fast_char: Option<Instant>,
+    consecutive_fast_chars: usize,
+    window_until: Option<Instant>,
+}
+
+impl PasteBurst {
+    fn on_plain_char(&mut self, now: Instant) {
+        let is_fast = self
+            .last_fast_char
+            .is_some_and(|last| now.duration_since(last) <= PASTE_BURST_CHAR_INTERVAL);
+        self.consecutive_fast_chars = if is_fast {
+            self.consecutive_fast_chars + 1
+        } else {
+            1
+        };
+        self.last_fast_char = Some(now);
+        if self.consecutive_fast_chars >= PASTE_BURST_MIN_CHARS {
+            self.window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
+        }
+    }
+
+    fn newline_instead_of_submit(&mut self, now: Instant) -> bool {
+        let suppress = self.window_until.is_some_and(|until| now <= until);
+        if suppress {
+            // A pasted newline keeps the burst alive for following chars.
+            self.on_plain_char(now);
+        }
+        suppress
+    }
+
+    fn reset(&mut self) {
+        self.last_fast_char = None;
+        self.consecutive_fast_chars = 0;
+        self.window_until = None;
+    }
+}
 
 pub enum ComposerAction {
     Submitted(String),
@@ -38,10 +88,19 @@ struct PendingPaste {
     payload: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplayRow {
+    global_char_start: usize,
+    text: String,
+}
+
 pub struct ComposerInput {
     textarea: TextArea<'static>,
     hint_items: Vec<(String, String)>,
     pending_pastes: Vec<PendingPaste>,
+    notice: Option<String>,
+    title: Option<String>,
+    paste_burst: PasteBurst,
 }
 
 impl ComposerInput {
@@ -50,10 +109,33 @@ impl ComposerInput {
             textarea: new_textarea(),
             hint_items: Vec::new(),
             pending_pastes: Vec::new(),
+            notice: None,
+            title: None,
+            paste_burst: PasteBurst::default(),
         }
     }
 
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+    }
+
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
+    pub fn set_title(&mut self, title: impl Into<String>) {
+        self.title = Some(title.into());
+    }
+
+    pub fn clear_title(&mut self) {
+        self.title = None;
+    }
+
     pub fn input(&mut self, key: KeyEvent) -> ComposerAction {
+        self.input_at(key, Instant::now())
+    }
+
+    fn input_at(&mut self, key: KeyEvent, now: Instant) -> ComposerAction {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return ComposerAction::None;
         }
@@ -65,12 +147,23 @@ impl ComposerInput {
         }
 
         if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            if self.paste_burst.newline_instead_of_submit(now) {
+                self.textarea.insert_newline();
+                self.reconcile_pending_pastes();
+                return ComposerAction::None;
+            }
             let text = self.submission_text();
             if !text.trim().is_empty() {
                 self.pending_pastes.clear();
                 return ComposerAction::Submitted(text);
             }
             return ComposerAction::None;
+        }
+
+        if is_plain_char_key(key) {
+            self.paste_burst.on_plain_char(now);
+        } else {
+            self.paste_burst.reset();
         }
 
         if self.handle_placeholder_delete(key) {
@@ -83,6 +176,7 @@ impl ComposerInput {
     }
 
     pub fn handle_paste(&mut self, pasted: String) -> bool {
+        self.paste_burst.reset();
         let pasted = normalize_pasted_text(&pasted);
         let char_count = pasted.chars().count();
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
@@ -100,6 +194,13 @@ impl ComposerInput {
 
     pub fn set_initial_text(&mut self, text: &str) {
         self.textarea.insert_str(text);
+    }
+
+    /// Replaces the entire composer contents, dropping any pending paste
+    /// payloads, and moves the cursor to the end. Used for history recall.
+    pub fn set_text_end(&mut self, text: &str) {
+        self.pending_pastes.clear();
+        self.set_text_and_cursor(text, text.chars().count());
     }
 
     pub fn is_empty(&self) -> bool {
@@ -144,13 +245,25 @@ impl ComposerInput {
         ))
     }
 
-    pub fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default().borders(Borders::ALL).title("Prompt");
+    pub fn render_ref(
+        &self,
+        area: Rect,
+        focused: bool,
+        theme: &Theme,
+        skill_mentions: &[String],
+        buf: &mut Buffer,
+    ) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(self.title.as_deref().unwrap_or("Prompt").to_string())
+            .style(theme.panel_style())
+            .border_style(theme.border_style(focused))
+            .title_style(theme.title_style(focused));
         let inner = block.inner(area);
         block.render(area, buf);
 
         if inner.width > 0 && inner.height > 0 {
-            clear_area(inner, buf);
+            clear_area(inner, theme.panel_style(), buf);
 
             let content_width = inner.width.max(1) as usize;
             if self.text().is_empty() {
@@ -159,9 +272,11 @@ impl ComposerInput {
                     inner.y,
                     "Compose new task",
                     content_width,
-                    Style::default().dim(),
+                    theme.muted_style(),
                 );
             } else {
+                let text = self.text();
+                let mention_ranges = skill_mention_ranges(&text, skill_mentions);
                 let rows = self.display_rows(content_width);
                 let (visual_row, _) = self.visual_cursor(content_width);
                 let first_visible_row = first_visible_row(visual_row, inner.height as usize);
@@ -171,29 +286,46 @@ impl ComposerInput {
                     .take(inner.height as usize)
                     .enumerate()
                 {
-                    buf.set_stringn(
+                    let line = styled_display_line(row, &mention_ranges, theme);
+                    buf.set_line(
                         inner.x,
                         inner.y + offset as u16,
-                        row,
-                        content_width,
-                        Style::default(),
+                        &line,
+                        content_width as u16,
                     );
                 }
             }
         }
 
-        if self.hint_items.is_empty() || area.height == 0 {
+        if area.height == 0 {
+            return;
+        }
+
+        if let Some(notice) = &self.notice {
+            buf.set_line(
+                area.x.saturating_add(2),
+                area.bottom().saturating_sub(1),
+                &Line::from(Span::styled(notice.as_str(), theme.warning_style())),
+                area.width.saturating_sub(4),
+            );
+            return;
+        }
+
+        if self.hint_items.is_empty() {
             return;
         }
 
         let mut spans = Vec::new();
         for (index, (key, label)) in self.hint_items.iter().enumerate() {
             if index > 0 {
-                spans.push("  ".dim());
+                spans.push(Span::styled("  ", theme.muted_style()));
             }
-            spans.push(key.as_str().bold());
-            spans.push(" ".dim());
-            spans.push(label.as_str().dim());
+            spans.push(Span::styled(
+                key.as_str(),
+                theme.title_style(false).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" ", theme.muted_style()));
+            spans.push(Span::styled(label.as_str(), theme.muted_style()));
         }
         buf.set_line(
             area.x.saturating_add(2),
@@ -225,7 +357,7 @@ impl ComposerInput {
         self.reconcile_pending_pastes();
     }
 
-    fn submission_text(&self) -> String {
+    pub fn submission_text(&self) -> String {
         let mut text = self.text();
         for paste in &self.pending_pastes {
             text = text.replacen(&paste.placeholder, &paste.payload, 1);
@@ -257,13 +389,23 @@ impl ComposerInput {
         }
     }
 
-    fn display_rows(&self, content_width: usize) -> Vec<String> {
+    fn display_rows(&self, content_width: usize) -> Vec<DisplayRow> {
         let mut rows = Vec::new();
+        let mut logical_line_start = 0;
         for line in self.textarea.lines() {
-            rows.extend(wrap_line(line, content_width));
+            rows.extend(wrap_segments(line, content_width).into_iter().map(
+                |(segment_start, text)| DisplayRow {
+                    global_char_start: logical_line_start + segment_start,
+                    text,
+                },
+            ));
+            logical_line_start += line.chars().count() + 1;
         }
         if rows.is_empty() {
-            rows.push(String::new());
+            rows.push(DisplayRow {
+                global_char_start: 0,
+                text: String::new(),
+            });
         }
         rows
     }
@@ -283,9 +425,14 @@ impl ComposerInput {
             .map(|line| wrap_line(line, content_width).len())
             .sum::<usize>();
 
-        let visual_row = rows_before + (col / content_width);
-        let visual_col = col % content_width;
-        (visual_row, visual_col)
+        let line = self
+            .textarea
+            .lines()
+            .get(row)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let (row_in_line, visual_col) = visual_position_in_line(line, content_width, col);
+        (rows_before + row_in_line, visual_col)
     }
 
     fn reconcile_pending_pastes(&mut self) {
@@ -384,28 +531,123 @@ fn normalize_pasted_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+/// Wraps a logical line into display rows, breaking after the last space that
+/// fits when possible (word wrap) and hard-breaking long words. Every source
+/// character lands in exactly one row so cursor offsets stay contiguous.
 fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    wrap_segments(line, width)
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
+}
+
+fn wrap_segments(line: &str, width: usize) -> Vec<(usize, String)> {
     let width = width.max(1);
-    if line.is_empty() {
-        return vec![String::new()];
+    let chars = line.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![(0, String::new())];
     }
 
-    let chars = line.chars().collect::<Vec<_>>();
-    chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect())
-        .collect()
+    let mut segments = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let remaining = chars.len() - start;
+        if remaining <= width {
+            segments.push((start, chars[start..].iter().collect()));
+            break;
+        }
+        let window = &chars[start..start + width];
+        let break_len = window
+            .iter()
+            .rposition(|ch| ch.is_whitespace())
+            .map(|index| index + 1)
+            .unwrap_or(width);
+        segments.push((start, chars[start..start + break_len].iter().collect()));
+        start += break_len;
+    }
+    segments
+}
+
+/// Maps a character column in a logical line to (row-within-line, column)
+/// under the same wrapping model as `wrap_line`.
+fn visual_position_in_line(line: &str, width: usize, col: usize) -> (usize, usize) {
+    let segments = wrap_segments(line, width);
+    for (row, (start, text)) in segments.iter().enumerate() {
+        let len = text.chars().count();
+        let is_last = row + 1 == segments.len();
+        if col < start + len || is_last {
+            return (row, col.saturating_sub(*start).min(len));
+        }
+    }
+    (0, 0)
 }
 
 fn first_visible_row(cursor_row: usize, height: usize) -> usize {
     cursor_row.saturating_sub(height.saturating_sub(1))
 }
 
-fn clear_area(area: Rect, buf: &mut Buffer) {
+fn clear_area(area: Rect, style: Style, buf: &mut Buffer) {
     let blank = " ".repeat(area.width as usize);
     for y in area.y..area.bottom() {
-        buf.set_string(area.x, y, &blank, Style::default());
+        buf.set_string(area.x, y, &blank, style);
     }
+}
+
+fn skill_mention_ranges(text: &str, mentions: &[String]) -> Vec<std::ops::Range<usize>> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    for start in 0..chars.len() {
+        if chars[start] != '$' {
+            continue;
+        }
+        for mention in mentions {
+            let mention = mention.chars().collect::<Vec<_>>();
+            let end = start + mention.len();
+            if end <= chars.len()
+                && chars[start..end] == mention
+                && chars
+                    .get(end)
+                    .is_none_or(|ch| !(ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/')))
+            {
+                ranges.push(start..end);
+                break;
+            }
+        }
+    }
+    ranges
+}
+
+fn styled_display_line(
+    row: &DisplayRow,
+    mention_ranges: &[std::ops::Range<usize>],
+    theme: &Theme,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_is_chip = false;
+    for (offset, ch) in row.text.chars().enumerate() {
+        let global = row.global_char_start + offset;
+        let is_chip = mention_ranges.iter().any(|range| range.contains(&global));
+        if !run.is_empty() && is_chip != run_is_chip {
+            let style = if run_is_chip {
+                theme.skill_chip_style()
+            } else {
+                theme.text_style()
+            };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_is_chip = is_chip;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        let style = if run_is_chip {
+            theme.skill_chip_style()
+        } else {
+            theme.text_style()
+        };
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
 }
 
 fn char_index_of(text: &str, needle: &str) -> Option<usize> {
@@ -437,6 +679,12 @@ fn row_col_for_char_index(text: &str, char_index: usize) -> (usize, usize) {
         .map(Iterator::count)
         .unwrap_or_default();
     (row, col)
+}
+
+fn is_plain_char_key(key: KeyEvent) -> bool {
+    let (code, modifiers) = normalize_key_parts(key.code, key.modifiers);
+    matches!(code, KeyCode::Char(_))
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn is_newline_key(key: KeyEvent) -> bool {
@@ -578,6 +826,104 @@ mod tests {
     }
 
     #[test]
+    fn burst_typed_enter_still_submits() {
+        let mut composer = ComposerInput::new();
+        let mut now = Instant::now();
+        // Human-speed typing: 100ms between chars.
+        for ch in ['h', 'i'] {
+            composer.input_at(KeyEvent::from(KeyCode::Char(ch)), now);
+            now += Duration::from_millis(100);
+        }
+
+        match composer.input_at(KeyEvent::from(KeyCode::Enter), now) {
+            ComposerAction::Submitted(text) => assert_eq!(text, "hi"),
+            ComposerAction::None => panic!("typed Enter should submit"),
+        }
+    }
+
+    #[test]
+    fn burst_paste_enter_inserts_newline_instead_of_submitting() {
+        let mut composer = ComposerInput::new();
+        let mut now = Instant::now();
+        // Paste-speed input: 1ms between chars.
+        for ch in ['a', 'b', 'c'] {
+            composer.input_at(KeyEvent::from(KeyCode::Char(ch)), now);
+            now += Duration::from_millis(1);
+        }
+
+        assert!(matches!(
+            composer.input_at(KeyEvent::from(KeyCode::Enter), now),
+            ComposerAction::None
+        ));
+        now += Duration::from_millis(1);
+        composer.input_at(KeyEvent::from(KeyCode::Char('d')), now);
+        assert_eq!(composer.text(), "abc\nd");
+
+        // Enter after the paste settles submits the whole thing.
+        now += Duration::from_millis(500);
+        match composer.input_at(KeyEvent::from(KeyCode::Enter), now) {
+            ComposerAction::Submitted(text) => assert_eq!(text, "abc\nd"),
+            ComposerAction::None => panic!("Enter after burst window should submit"),
+        }
+    }
+
+    #[test]
+    fn burst_window_survives_pasted_newline_runs() {
+        let mut composer = ComposerInput::new();
+        let mut now = Instant::now();
+        for ch in ['a', 'b', 'c'] {
+            composer.input_at(KeyEvent::from(KeyCode::Char(ch)), now);
+            now += Duration::from_millis(1);
+        }
+        // Two consecutive pasted newlines: both must insert, not submit.
+        for _ in 0..2 {
+            assert!(matches!(
+                composer.input_at(KeyEvent::from(KeyCode::Enter), now),
+                ComposerAction::None
+            ));
+            now += Duration::from_millis(1);
+        }
+
+        assert_eq!(composer.text(), "abc\n\n");
+    }
+
+    #[test]
+    fn bracketed_paste_resets_burst_state() {
+        let mut composer = ComposerInput::new();
+        let mut now = Instant::now();
+        for ch in ['a', 'b', 'c'] {
+            composer.input_at(KeyEvent::from(KeyCode::Char(ch)), now);
+            now += Duration::from_millis(1);
+        }
+        composer.handle_paste(" pasted".to_string());
+
+        match composer.input_at(KeyEvent::from(KeyCode::Enter), now) {
+            ComposerAction::Submitted(text) => assert_eq!(text, "abc pasted"),
+            ComposerAction::None => panic!("bracketed paste should clear burst suppression"),
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_at_word_boundaries() {
+        assert_eq!(
+            wrap_line("fix the composer", 8),
+            vec!["fix the ", "composer"]
+        );
+        assert_eq!(wrap_line("a bb ccc dddd", 5), vec!["a bb ", "ccc ", "dddd"]);
+        // Long words still hard-break.
+        assert_eq!(wrap_line("abcdefgh", 3), vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn wrapped_cursor_follows_word_boundaries() {
+        // "fix the composer": cursor after "the " (index 8) is start of row 1.
+        assert_eq!(visual_position_in_line("fix the composer", 8, 8), (1, 0));
+        assert_eq!(visual_position_in_line("fix the composer", 8, 7), (0, 7));
+        assert_eq!(visual_position_in_line("fix the composer", 8, 16), (1, 8));
+        assert_eq!(visual_position_in_line("", 8, 0), (0, 0));
+    }
+
+    #[test]
     fn wrap_and_cursor_use_same_visual_model() {
         let mut composer = ComposerInput::new();
         composer.set_initial_text("abcdefghij");
@@ -593,11 +939,26 @@ mod tests {
         let area = Rect::new(0, 0, 6, 5);
         let mut buffer = Buffer::empty(area);
 
-        composer.render_ref(area, &mut buffer);
+        composer.render_ref(area, true, &Theme::catppuccin(), &[], &mut buffer);
 
         assert_eq!(row_text(&buffer, 1, 1, 4), "abcd");
         assert_eq!(row_text(&buffer, 1, 2, 4), "efgh");
         assert_eq!(row_text(&buffer, 1, 3, 4), "ij  ");
+    }
+
+    #[test]
+    fn known_skill_mentions_render_as_theme_chips() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("use $fusion now");
+        let area = Rect::new(0, 0, 24, 4);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::catppuccin();
+
+        composer.render_ref(area, true, &theme, &["$fusion".to_string()], &mut buffer);
+
+        assert_eq!(buffer[(5, 1)].symbol(), "$ ".trim());
+        assert_eq!(buffer[(5, 1)].style().bg, Some(theme.surface0));
+        assert_eq!(buffer[(4, 1)].style().bg, Some(theme.panel_bg));
     }
 
     #[test]

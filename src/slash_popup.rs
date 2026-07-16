@@ -3,7 +3,6 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::prelude::*;
-use ratatui::style::Stylize;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
@@ -12,6 +11,7 @@ use ratatui::widgets::ListItem;
 
 use crate::slash_commands;
 use crate::slash_commands::SlashCommand;
+use crate::theme::Theme;
 
 const MAX_ROWS: usize = 8;
 
@@ -83,7 +83,7 @@ impl SlashPopup {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let title = if self.query.is_empty() {
             "Commands /".to_string()
         } else {
@@ -94,17 +94,27 @@ impl SlashPopup {
             .saturating_sub(MAX_ROWS - 1)
             .min(self.matches.len().saturating_sub(MAX_ROWS));
         let items = if self.matches.is_empty() {
-            vec![ListItem::new(Line::from("no matches".dim()))]
+            vec![ListItem::new(Line::from(Span::styled(
+                "no matches",
+                theme.muted_style(),
+            )))]
         } else {
             self.matches
                 .iter()
                 .skip(start)
                 .take(MAX_ROWS)
                 .enumerate()
-                .map(|(row, command)| render_command_row(command, start + row == selected))
+                .map(|(row, command)| render_command_row(command, start + row == selected, theme))
                 .collect::<Vec<_>>()
         };
-        let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(theme.panel_style())
+                .border_style(theme.border_style(true))
+                .title_style(theme.title_style(true)),
+        );
         Clear.render(area, buf);
         Widget::render(list, area, buf);
     }
@@ -157,14 +167,37 @@ impl SlashPopup {
     }
 }
 
-fn render_command_row(command: &SlashCommand, selected: bool) -> ListItem<'_> {
+fn render_command_row(command: &SlashCommand, selected: bool, theme: &Theme) -> ListItem<'static> {
     let marker = if selected { "> " } else { "  " };
-    let mut spans = vec![marker.into(), format!("/{}", command.name).cyan()];
+    let row_style = if selected {
+        theme.selected_style()
+    } else {
+        theme.panel_style()
+    };
+    let command_style = if selected {
+        row_style
+    } else {
+        Style::default()
+            .fg(theme.teal)
+            .bg(theme.panel_bg)
+            .add_modifier(Modifier::BOLD)
+    };
+    let mut spans = vec![
+        Span::styled(marker, row_style),
+        Span::styled(format!("/{}", command.name), command_style),
+    ];
     if !command.description.is_empty() {
-        spans.push(" ".dim());
-        spans.push(command.description.dim());
+        spans.push(Span::styled(" ", row_style));
+        spans.push(Span::styled(
+            command.description,
+            if selected {
+                row_style
+            } else {
+                theme.muted_style()
+            },
+        ));
     }
-    ListItem::new(Line::from(spans))
+    ListItem::new(Line::from(spans)).style(row_style)
 }
 
 #[cfg(test)]

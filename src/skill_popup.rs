@@ -3,7 +3,6 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::prelude::*;
-use ratatui::style::Stylize;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Clear;
@@ -11,6 +10,7 @@ use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
 
 use crate::skills::Skill;
+use crate::theme::Theme;
 
 const MAX_ROWS: usize = 8;
 
@@ -86,7 +86,7 @@ impl SkillPopup {
         matches.into_iter().map(|(_, index)| index).collect()
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, skills: &[Skill]) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, skills: &[Skill], theme: &Theme) {
         let matches = self.matching_indices(skills);
         let selected = self.selected.min(matches.len().saturating_sub(1));
         let start = selected
@@ -102,9 +102,16 @@ impl SkillPopup {
             .skip(start)
             .take(MAX_ROWS)
             .enumerate()
-            .map(|(row, index)| render_skill_row(&skills[*index], start + row == selected))
+            .map(|(row, index)| render_skill_row(&skills[*index], start + row == selected, theme))
             .collect::<Vec<_>>();
-        let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(theme.panel_style())
+                .border_style(theme.border_style(true))
+                .title_style(theme.title_style(true)),
+        );
         Clear.render(area, buf);
         Widget::render(list, area, buf);
     }
@@ -151,14 +158,37 @@ impl SkillPopup {
     }
 }
 
-fn render_skill_row(skill: &Skill, selected: bool) -> ListItem<'_> {
+fn render_skill_row(skill: &Skill, selected: bool, theme: &Theme) -> ListItem<'static> {
     let marker = if selected { "> " } else { "  " };
-    let mut spans = vec![marker.into(), skill.mention().cyan()];
+    let row_style = if selected {
+        theme.selected_style()
+    } else {
+        theme.panel_style()
+    };
+    let mention_style = if selected {
+        row_style
+    } else {
+        Style::default()
+            .fg(theme.mauve)
+            .bg(theme.panel_bg)
+            .add_modifier(Modifier::BOLD)
+    };
+    let mut spans = vec![
+        Span::styled(marker, row_style),
+        Span::styled(skill.mention(), mention_style),
+    ];
     if !skill.description.is_empty() {
-        spans.push(" ".dim());
-        spans.push(skill.description.clone().dim());
+        spans.push(Span::styled(" ", row_style));
+        spans.push(Span::styled(
+            skill.description.clone(),
+            if selected {
+                row_style
+            } else {
+                theme.muted_style()
+            },
+        ));
     }
-    ListItem::new(Line::from(spans))
+    ListItem::new(Line::from(spans)).style(row_style)
 }
 
 fn match_score(skill: &Skill, query: &str) -> Option<(u8, String)> {

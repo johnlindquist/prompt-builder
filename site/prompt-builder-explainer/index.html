@@ -1,0 +1,1103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prompt Builder: pre-flight prompt building for Codex</title>
+    <meta
+      name="description"
+      content="A branded explainer for Prompt Builder, the terminal pre-flight composer for Codex prompts, skills, file references, handoff options, and launch inspection."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23FBF3E0'/%3E%3Ccircle cx='32' cy='32' r='22' fill='%23F7C948' stroke='%231E2A38' stroke-width='4'/%3E%3Cpath d='M20 27l8 6-8 6' fill='none' stroke='%231E2A38' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M34 40h12' fill='none' stroke='%231E2A38' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Nunito:wght@400..1000&family=Caveat:wght@600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #fbf3e0;
+        --cream: #fdf8ec;
+        --shell: #f6edd8;
+        --yolk: #f7c948;
+        --yolk-deep: #e8b229;
+        --yolk-shadow: #c28e12;
+        --ink: #1e2a38;
+        --ink-soft: #43536a;
+        --rust: #a05040;
+        --sky: #a8d4e2;
+        --sage: #9dbe8d;
+        --navy: #16222f;
+        --line: #e2d5b4;
+        --eggo-page: #f3e9d2;
+        --font-ui: Nunito, ui-sans-serif, system-ui, -apple-system,
+          BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --font-hand: Caveat, "Comic Sans MS", "Segoe Print", cursive;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", monospace;
+        --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.82) inset,
+          0 1px 2px rgba(120, 90, 30, 0.1),
+          0 8px 24px -8px rgba(120, 90, 30, 0.28),
+          0 2px 4px -1px rgba(120, 90, 30, 0.12);
+        --shadow-card-deep: 0 1px 0 rgba(255, 255, 255, 0.9) inset,
+          0 14px 36px -14px rgba(100, 70, 20, 0.35),
+          0 4px 8px -2px rgba(100, 70, 20, 0.15);
+        --shadow-btn: 0 1px 0 rgba(255, 255, 255, 0.65) inset,
+          0 3px 0 #c28e12, 0 6px 10px -2px rgba(120, 80, 10, 0.35);
+        --shadow-well: inset 0 2px 6px rgba(120, 90, 30, 0.2),
+          inset 0 1px 2px rgba(120, 90, 30, 0.22),
+          0 1px 0 rgba(255, 255, 255, 0.7);
+        --yolk-grad: linear-gradient(180deg, #ffd968 0%, #f7c948 45%, #efb838 100%);
+        --cream-grad: linear-gradient(180deg, #fffdf6 0%, #fbf3e0 100%);
+        --shell-grad: linear-gradient(180deg, #fdf8ec 0%, #f3e8ce 100%);
+        --rust-grad: linear-gradient(180deg, #b5604e 0%, #a05040 55%, #8f4536 100%);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 20% 0%, rgba(255, 255, 255, 0.45), transparent 34rem),
+          linear-gradient(180deg, var(--paper), var(--eggo-page));
+        font-family: var(--font-ui);
+        font-size: 17px;
+        line-height: 1.55;
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        opacity: 0.28;
+        background-image:
+          linear-gradient(rgba(30, 42, 56, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(30, 42, 56, 0.025) 1px, transparent 1px);
+        background-size: 34px 34px;
+        mix-blend-mode: multiply;
+      }
+
+      a {
+        color: var(--rust);
+        text-decoration-thickness: 1px;
+        text-underline-offset: 3px;
+      }
+
+      .wrap {
+        width: min(1180px, calc(100% - 32px));
+        margin: 0 auto;
+      }
+
+      .site-nav {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        border-bottom: 1px solid rgba(160, 130, 76, 0.45);
+        background: rgba(251, 243, 224, 0.94);
+        backdrop-filter: blur(8px);
+      }
+
+      .site-nav .wrap {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        min-height: 58px;
+      }
+
+      .mark {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.55rem;
+        font-weight: 1000;
+      }
+
+      .mark-dot {
+        display: inline-grid;
+        place-items: center;
+        width: 2rem;
+        height: 2rem;
+        border: 1px solid var(--yolk-shadow);
+        border-radius: 999px;
+        background: var(--yolk-grad);
+        box-shadow: var(--shadow-btn);
+        font-family: var(--font-mono);
+        font-size: 0.85rem;
+      }
+
+      .nav-links {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 0.7rem 1rem;
+        font-size: 0.9rem;
+        font-weight: 850;
+      }
+
+      .nav-links a {
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .hero {
+        padding: 44px 0 28px;
+      }
+
+      .hero-sheet,
+      .section-sheet,
+      .card,
+      .story,
+      .code-panel,
+      .note {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: linear-gradient(180deg, #fffdf6 0%, var(--cream) 100%);
+        box-shadow: var(--shadow-card);
+      }
+
+      .hero-sheet {
+        position: relative;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(310px, 0.82fr);
+        gap: clamp(22px, 4vw, 48px);
+        align-items: center;
+        padding: clamp(24px, 4.6vw, 56px);
+        overflow: hidden;
+      }
+
+      .eyebrow,
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--cream-grad);
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.8) inset,
+          0 2px 6px -1px rgba(120, 90, 30, 0.18);
+        color: var(--ink);
+        font-size: 0.78rem;
+        font-weight: 950;
+        letter-spacing: 0.08em;
+        padding: 0.42rem 0.72rem 0.34rem;
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2,
+      h3 {
+        margin: 0;
+        line-height: 1.08;
+        letter-spacing: 0;
+      }
+
+      h1 {
+        max-width: 780px;
+        margin-top: 1rem;
+        font-size: clamp(2.2rem, 7vw, 5.1rem);
+        font-weight: 1000;
+      }
+
+      h2 {
+        font-size: clamp(1.8rem, 4vw, 3.15rem);
+        font-weight: 1000;
+      }
+
+      h3 {
+        font-size: clamp(1.15rem, 2.2vw, 1.55rem);
+        font-weight: 950;
+      }
+
+      p {
+        margin: 0;
+      }
+
+      .lede {
+        max-width: 700px;
+        margin-top: 1rem;
+        color: var(--ink-soft);
+        font-size: clamp(1.05rem, 2vw, 1.28rem);
+      }
+
+      .support {
+        margin-top: 1rem;
+        color: var(--ink);
+        font-weight: 850;
+      }
+
+      .hero-visual {
+        position: relative;
+        display: grid;
+        gap: 0.85rem;
+      }
+
+      .terminal-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fffdf6;
+        box-shadow: var(--shadow-card-deep);
+        overflow: hidden;
+      }
+
+      .terminal-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        border-bottom: 1px solid var(--line);
+        background: var(--shell-grad);
+        padding: 0.75rem 0.9rem;
+        font-family: var(--font-mono);
+        font-weight: 800;
+      }
+
+      .lights {
+        display: inline-flex;
+        gap: 0.35rem;
+      }
+
+      .lights span {
+        width: 0.72rem;
+        height: 0.72rem;
+        border: 1px solid rgba(30, 42, 56, 0.3);
+        border-radius: 999px;
+        background: var(--yolk);
+      }
+
+      .terminal-body {
+        display: grid;
+        gap: 0.65rem;
+        padding: 1rem;
+      }
+
+      .field {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--cream);
+        box-shadow: var(--shadow-well);
+        padding: 0.75rem 0.85rem;
+      }
+
+      .field b {
+        display: block;
+        margin-bottom: 0.25rem;
+        color: var(--ink-soft);
+        font-size: 0.75rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .prompt-line {
+        font-family: var(--font-mono);
+        font-size: 0.95rem;
+      }
+
+      .route {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.8rem;
+        color: var(--ink-soft);
+        font-weight: 900;
+      }
+
+      .route strong {
+        color: var(--ink);
+      }
+
+      .hand-note {
+        color: var(--rust);
+        font-family: var(--font-hand);
+        font-size: 1.7rem;
+        font-weight: 700;
+        line-height: 1;
+        transform: rotate(-1.5deg);
+      }
+
+      main {
+        display: grid;
+        gap: 28px;
+        padding-bottom: 42px;
+      }
+
+      section {
+        scroll-margin-top: 82px;
+      }
+
+      .section-sheet {
+        padding: clamp(20px, 3.2vw, 34px);
+      }
+
+      .section-head {
+        display: grid;
+        gap: 0.7rem;
+        max-width: 820px;
+        margin-bottom: 1.2rem;
+      }
+
+      .section-head p,
+      .body-copy {
+        color: var(--ink-soft);
+        font-size: 1.04rem;
+      }
+
+      .grid {
+        display: grid;
+        gap: 1rem;
+      }
+
+      .grid.cols-4 {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+
+      .grid.cols-3 {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .grid.cols-2 {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .card {
+        padding: 1rem;
+      }
+
+      .card p {
+        margin-top: 0.45rem;
+        color: var(--ink-soft);
+      }
+
+      .preflight-card {
+        border-color: var(--yolk-shadow);
+        background: linear-gradient(180deg, #fff8d1 0%, #f9e99a 100%);
+      }
+
+      .process {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 0.8rem;
+        counter-reset: step;
+      }
+
+      .step {
+        position: relative;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--cream-grad);
+        box-shadow: var(--shadow-card);
+        padding: 1rem;
+      }
+
+      .step::before {
+        counter-increment: step;
+        content: counter(step);
+        display: inline-grid;
+        place-items: center;
+        width: 1.75rem;
+        height: 1.75rem;
+        margin-bottom: 0.75rem;
+        border: 1px solid var(--yolk-shadow);
+        border-radius: 999px;
+        background: var(--yolk-grad);
+        font-weight: 1000;
+      }
+
+      .step h3 {
+        font-size: 1.03rem;
+      }
+
+      .step p {
+        margin-top: 0.4rem;
+        color: var(--ink-soft);
+        font-size: 0.94rem;
+      }
+
+      .stories {
+        display: grid;
+        gap: 1.15rem;
+      }
+
+      .story {
+        display: grid;
+        grid-template-columns: minmax(280px, 0.95fr) minmax(0, 1fr);
+        gap: clamp(18px, 3vw, 28px);
+        align-items: center;
+        padding: clamp(14px, 2.3vw, 24px);
+      }
+
+      .story:nth-child(even) {
+        grid-template-columns: minmax(0, 1fr) minmax(280px, 0.95fr);
+      }
+
+      .story:nth-child(even) .story-media {
+        order: 2;
+      }
+
+      .story img {
+        display: block;
+        width: 100%;
+        height: auto;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper);
+        box-shadow: var(--shadow-card);
+      }
+
+      .story-copy {
+        display: grid;
+        gap: 0.75rem;
+      }
+
+      .micro {
+        display: grid;
+        gap: 0.55rem;
+      }
+
+      .micro-row {
+        display: grid;
+        gap: 0.2rem;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--shell);
+        box-shadow: var(--shadow-well);
+        padding: 0.7rem 0.8rem;
+      }
+
+      .micro-row b {
+        color: var(--rust);
+        font-size: 0.74rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .micro-row code {
+        color: var(--ink);
+        font-family: var(--font-mono);
+        font-size: 0.9rem;
+        white-space: normal;
+      }
+
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0.9rem;
+      }
+
+      .feature {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--cream-grad);
+        box-shadow: var(--shadow-card);
+        padding: 1rem;
+      }
+
+      .feature strong {
+        display: block;
+        font-weight: 1000;
+      }
+
+      .feature span {
+        display: block;
+        margin-top: 0.35rem;
+        color: var(--ink-soft);
+        font-size: 0.94rem;
+      }
+
+      .code-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+      }
+
+      .code-panel {
+        overflow: hidden;
+        background: var(--navy);
+      }
+
+      .code-title {
+        border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--cream);
+        font-size: 0.82rem;
+        font-weight: 950;
+        letter-spacing: 0.06em;
+        padding: 0.7rem 0.85rem;
+        text-transform: uppercase;
+      }
+
+      pre {
+        margin: 0;
+        overflow-x: auto;
+        color: #fdf8ec;
+        font-family: var(--font-mono);
+        font-size: 0.86rem;
+        line-height: 1.55;
+        padding: 0.9rem;
+      }
+
+      code {
+        font-family: var(--font-mono);
+      }
+
+      .boundary-list {
+        display: grid;
+        gap: 0.85rem;
+      }
+
+      .boundary {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 0.75rem;
+        align-items: start;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--cream-grad);
+        box-shadow: var(--shadow-card);
+        padding: 0.95rem;
+      }
+
+      .boundary::before {
+        content: "";
+        width: 0.95rem;
+        height: 0.95rem;
+        margin-top: 0.28rem;
+        border: 1px solid var(--rust);
+        border-radius: 999px;
+        background: var(--rust-grad);
+      }
+
+      .note {
+        border-left: 5px solid var(--rust);
+        background: linear-gradient(180deg, #fff4bd 0%, #f9e58a 100%);
+        padding: 1rem;
+      }
+
+      .note strong {
+        display: block;
+        font-family: var(--font-hand);
+        font-size: 1.55rem;
+        line-height: 1;
+        color: var(--rust);
+      }
+
+      .verify-list {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0.9rem;
+      }
+
+      .verify-list ul {
+        margin: 0.6rem 0 0;
+        padding-left: 1.1rem;
+        color: var(--ink-soft);
+      }
+
+      footer {
+        padding: 28px 0 46px;
+        color: var(--ink-soft);
+        font-size: 0.95rem;
+      }
+
+      @media (max-width: 980px) {
+        .hero-sheet,
+        .story,
+        .story:nth-child(even),
+        .grid.cols-4,
+        .grid.cols-3,
+        .grid.cols-2,
+        .code-grid,
+        .verify-list {
+          grid-template-columns: 1fr;
+        }
+
+        .story:nth-child(even) .story-media {
+          order: 0;
+        }
+
+        .process,
+        .feature-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 640px) {
+        body {
+          font-size: 16px;
+        }
+
+        .site-nav {
+          position: static;
+        }
+
+        .site-nav .wrap {
+          align-items: flex-start;
+          flex-direction: column;
+          padding: 0.85rem 0;
+        }
+
+        .nav-links {
+          justify-content: flex-start;
+        }
+
+        .hero {
+          padding-top: 20px;
+        }
+
+        .hero-sheet,
+        .section-sheet {
+          padding: 18px;
+        }
+
+        .process,
+        .feature-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="site-nav" aria-label="Page sections">
+      <div class="wrap">
+        <a class="mark" href="#overview" aria-label="Prompt Builder overview">
+          <span class="mark-dot">p</span>
+          <span>Prompt Builder</span>
+        </a>
+        <div class="nav-links">
+          <a href="#workflow">Workflow</a>
+          <a href="#stories">Stories</a>
+          <a href="#features">Features</a>
+          <a href="#cli">CLI</a>
+          <a href="#boundaries">Boundaries</a>
+        </div>
+      </div>
+    </nav>
+
+    <header class="hero" id="overview">
+      <div class="wrap">
+        <div class="hero-sheet">
+          <div>
+            <span class="eyebrow">terminal pre-flight for Codex</span>
+            <h1>Build the prompt before Codex takes off.</h1>
+            <p class="lede">
+              Prompt Builder is a small terminal composer for the moment before
+              execution. Use it to name the work, shape the prompt, add skills,
+              reference files, inspect the command, and hand off only when the
+              task is ready.
+            </p>
+            <p class="support">
+              It sits between your shell and Codex. It does not replace Codex.
+              It makes the launch cleaner.
+            </p>
+          </div>
+          <div class="hero-visual" aria-label="Prompt Builder flow preview">
+            <div class="terminal-card">
+              <div class="terminal-top">
+                <span class="lights" aria-hidden="true"><span></span><span></span><span></span></span>
+                <span>prompt-builder</span>
+              </div>
+              <div class="terminal-body">
+                <div class="field">
+                  <b>Name</b>
+                  <div class="prompt-line">prompt-builder:Fix focused fork</div>
+                </div>
+                <div class="field">
+                  <b>Prompt</b>
+                  <div class="prompt-line">
+                    Start with $fusion, inspect @src/main.rs, patch the handoff
+                    path, and verify the dry run.
+                  </div>
+                </div>
+                <div class="route">
+                  <span>compose</span>
+                  <span>enrich</span>
+                  <span>inspect</span>
+                  <strong>handoff</strong>
+                </div>
+              </div>
+            </div>
+            <p class="hand-note">a quiet cockpit before execution</p>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <section class="section-sheet" id="problem">
+        <div class="section-head">
+          <span class="chip">why pre-flight matters</span>
+          <h2>A prompt is not just text. It is a launch.</h2>
+          <p>
+            When the prompt is vague, the run starts vague. That means more
+            correction, more context repair, and more time spent steering an
+            agent that already left the runway.
+          </p>
+        </div>
+        <div class="grid cols-4">
+          <article class="card">
+            <h3>Before</h3>
+            <p>A half-formed prompt goes straight into execution.</p>
+          </article>
+          <article class="card">
+            <h3>During</h3>
+            <p>The agent starts making assumptions while the real task is still forming.</p>
+          </article>
+          <article class="card">
+            <h3>After</h3>
+            <p>The developer spends the session cleaning up intent.</p>
+          </article>
+          <article class="card preflight-card">
+            <h3>Pre-flight</h3>
+            <p>Compose, enrich, inspect, then launch.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section-sheet" id="what">
+        <div class="section-head">
+          <span class="chip">what it does</span>
+          <h2>Prompt Builder opens a focused terminal UI before handoff.</h2>
+          <p>
+            It supports a prompt field, optional conversation name, skill lookup,
+            file lookup, handoff options, Codex pass-through flags, dry-run
+            output, and structured launch JSON.
+          </p>
+        </div>
+        <div class="grid cols-3">
+          <div class="card">
+            <h3>Compose</h3>
+            <p>Write the real task before a tool that can edit files receives it.</p>
+          </div>
+          <div class="card">
+            <h3>Enrich</h3>
+            <p>Add skill mentions and file references while the prompt is still forming.</p>
+          </div>
+          <div class="card">
+            <h3>Handoff</h3>
+            <p>Submit to Codex or pass the final prompt as an argv element to a wrapper.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-sheet" id="workflow">
+        <div class="section-head">
+          <span class="chip">the loop</span>
+          <h2>The pre-flight loop</h2>
+          <p>
+            Prompt Builder keeps the workflow boring in the best way: prepare the
+            prompt before the command that can run tools receives it.
+          </p>
+        </div>
+        <div class="process">
+          <article class="step">
+            <h3>Open</h3>
+            <p>Start empty, prefill text, or pipe content from another command.</p>
+          </article>
+          <article class="step">
+            <h3>Name</h3>
+            <p>Give the work a short thread name when that helps the run stay legible.</p>
+          </article>
+          <article class="step">
+            <h3>Compose</h3>
+            <p>Use Enter to submit and Shift+Enter for new lines.</p>
+          </article>
+          <article class="step">
+            <h3>Add context</h3>
+            <p>Use <code>$</code> for skills and <code>@</code> for files.</p>
+          </article>
+          <article class="step">
+            <h3>Choose route</h3>
+            <p>For wrappers, toggle options like fork, compact, or custom args.</p>
+          </article>
+          <article class="step">
+            <h3>Inspect or submit</h3>
+            <p>Print the prompt, command, launch JSON, dry-run, or submit.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section-sheet" id="stories">
+        <div class="section-head">
+          <span class="chip">user stories</span>
+          <h2>Where it earns its keep</h2>
+          <p>
+            Prompt Builder is for the moments where a little structure before
+            execution prevents a messy session afterward.
+          </p>
+        </div>
+        <div class="stories">
+          <article class="story">
+            <div class="story-media">
+              <img
+                src="assets/infographics/compose-before-launch.png"
+                alt="A developer turns a rough prompt into a precise task before sending it to Codex."
+              />
+            </div>
+            <div class="story-copy">
+              <h3>Turn "fix this" into an executable task.</h3>
+              <p>
+                A developer starts with a rough idea, but does not want Codex
+                acting on it yet. Prompt Builder gives them a staging area to
+                name the thread, write the real task, add verification
+                instructions, and only then send it.
+              </p>
+              <div class="micro">
+                <div class="micro-row"><b>Before</b><code>fix focus bug</code></div>
+                <div class="micro-row"><b>After</b><code>Inspect the focus flow, reproduce, patch, and verify.</code></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="story">
+            <div class="story-media">
+              <img
+                src="assets/infographics/fork-compact-handoff.png"
+                alt="Prompt Builder routes a composed prompt through wrapper options like fork and compact before handoff."
+              />
+            </div>
+            <div class="story-copy">
+              <h3>Route the next move through the right wrapper.</h3>
+              <p>
+                A user working from a focused Codex pane can compose the next
+                prompt and hand it through a wrapper with fork and compact
+                options visible. Prompt Builder does not own wrapper
+                orchestration; it forwards selected option tokens and the final
+                prompt.
+              </p>
+              <div class="micro">
+                <div class="micro-row"><b>Before</b><code>continue from last, but compact first</code></div>
+                <div class="micro-row"><b>After</b><code>handoff args + enabled toggles + final prompt</code></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="story">
+            <div class="story-media">
+              <img
+                src="assets/infographics/skill-aware-prompt.png"
+                alt="A user inserts a $fusion skill into a prompt from a skill lookup popup."
+              />
+            </div>
+            <div class="story-copy">
+              <h3>Add the right skill while the prompt is still being written.</h3>
+              <p>
+                Instead of remembering exact skill names or typing them cold,
+                the user opens skill lookup with <code>$</code>, filters the
+                list, and inserts the selected skill into the prompt.
+              </p>
+              <div class="micro">
+                <div class="micro-row"><b>Before</b><code>use fusion somehow</code></div>
+                <div class="micro-row"><b>After</b><code>Start with $fusion, inspect the failing path, patch, then verify.</code></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="story">
+            <div class="story-media">
+              <img
+                src="assets/infographics/file-aware-prompt.png"
+                alt="A user references project files with @ search before submitting the prompt."
+              />
+            </div>
+            <div class="story-copy">
+              <h3>Reference files before the handoff.</h3>
+              <p>
+                The user types an <code>@</code> reference, searches the project
+                file list, accepts the right path, and submits a prompt that
+                names the files Codex should inspect first.
+              </p>
+              <div class="micro">
+                <div class="micro-row"><b>Before</b><code>inspect @ma</code></div>
+                <div class="micro-row"><b>After</b><code>inspect src/main.rs</code></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="story">
+            <div class="story-media">
+              <img
+                src="assets/infographics/scriptable-launch.png"
+                alt="Prompt Builder can print command output or structured launch JSON for shell workflows."
+              />
+            </div>
+            <div class="story-copy">
+              <h3>Inspect the launch before it runs.</h3>
+              <p>
+                For shell, cmux, or wrapper workflows, Prompt Builder can print
+                the composed prompt, render the command, dry-run submission, or
+                emit structured launch JSON so other tools do not parse
+                shell-quoted text.
+              </p>
+              <div class="micro">
+                <div class="micro-row"><b>Before</b><code>pipe text into a tool and hope</code></div>
+                <div class="micro-row"><b>After</b><code>print prompt / print command / launch JSON / dry-run</code></div>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section-sheet" id="features">
+        <div class="section-head">
+          <span class="chip">capability map</span>
+          <h2>Core features</h2>
+          <p>
+            The tool stays small. Each feature belongs to the moment before the
+            handoff.
+          </p>
+        </div>
+        <div class="feature-grid">
+          <div class="feature"><strong>Composer</strong><span>Shape the prompt, including multiline tasks and large pasted context.</span></div>
+          <div class="feature"><strong>Conversation name</strong><span>Prefix submitted names with the cwd basename and export CODEX_THREAD_NAME.</span></div>
+          <div class="feature"><strong>Skills</strong><span>Scan skill directories, filter with <code>$</code>, and insert the selected mention.</span></div>
+          <div class="feature"><strong>Files</strong><span>Search files with <code>@</code>, accept a match, and insert the path.</span></div>
+          <div class="feature"><strong>Handoff mode</strong><span>Call another command with the composed prompt as the final argv element.</span></div>
+          <div class="feature"><strong>Launch toggles</strong><span>Expose wrapper options like fork, compact, and custom launch arguments.</span></div>
+          <div class="feature"><strong>Inspectable output</strong><span>Print the prompt, print the command, dry-run, or emit launch JSON.</span></div>
+          <div class="feature"><strong>Codex pass-through</strong><span>Pass cwd, profile, model, instructions, developer instructions, and config.</span></div>
+        </div>
+      </section>
+
+      <section class="section-sheet" id="cli">
+        <div class="section-head">
+          <span class="chip">recipes</span>
+          <h2>CLI examples</h2>
+          <p>Practical commands for the workflows this page describes.</p>
+        </div>
+        <div class="code-grid">
+          <div class="code-panel">
+            <div class="code-title">Open and compose</div>
+            <pre><code>prompt-builder
+prompt-builder "fix the focus in the main window"</code></pre>
+          </div>
+          <div class="code-panel">
+            <div class="code-title">Submit from stdin</div>
+            <pre><code>printf 'fix the focus in the main window\n' | \
+  prompt-builder --submit</code></pre>
+          </div>
+          <div class="code-panel">
+            <div class="code-title">Print for pipelines</div>
+            <pre><code>printf 'explain this\n' | \
+  prompt-builder --stdin --print-prompt</code></pre>
+          </div>
+          <div class="code-panel">
+            <div class="code-title">Inspect before launch</div>
+            <pre><code>prompt-builder --dry-run --print-command "hello"
+prompt-builder --print-launch-json "hello"</code></pre>
+          </div>
+          <div class="code-panel">
+            <div class="code-title">Handoff mode</div>
+            <pre><code>prompt-builder --handoff-command xfc
+prompt-builder --handoff-command x \
+  --handoff-arg fork \
+  --handoff-arg=--last</code></pre>
+          </div>
+          <div class="code-panel">
+            <div class="code-title">Fork and compact toggles</div>
+            <pre><code>prompt-builder \
+  --handoff-command xfc \
+  --fork-from last \
+  --compact</code></pre>
+          </div>
+          <div class="code-panel">
+            <div class="code-title">Codex pass-through</div>
+            <pre><code>prompt-builder \
+  -C ~/dev/codex \
+  --profile fixit \
+  --model gpt-5.5 \
+  -c 'instructions="Be concise."'</code></pre>
+          </div>
+          <div class="code-panel">
+            <div class="code-title">Instruction shorthands</div>
+            <pre><code>prompt-builder --instructions "Base instructions"
+prompt-builder --developer-instructions \
+  "Inspect source first."</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="section-sheet" id="boundaries">
+        <div class="section-head">
+          <span class="chip">what it is not</span>
+          <h2>Boundaries and safety</h2>
+          <p>
+            Prompt Builder should be explained plainly. Its power comes from
+            being small.
+          </p>
+        </div>
+        <div class="boundary-list">
+          <div class="boundary"><div><strong>Not a Codex replacement.</strong><br />It composes and routes the prompt before Codex or a handoff command receives it.</div></div>
+          <div class="boundary"><div><strong>Not the wrapper orchestrator.</strong><br />Fork, compact, and app-server behavior belong to the wrapper. Prompt Builder forwards selected argv tokens.</div></div>
+          <div class="boundary"><div><strong>Not shell eval.</strong><br />Handoff mode passes the prompt as an argument, not by evaluating shell text.</div></div>
+          <div class="boundary"><div><strong>Default Codex launch is powerful.</strong><br />The default launcher uses <code>--dangerously-bypass-approvals-and-sandbox</code>. Use trusted directories and inspect before running.</div></div>
+          <div class="boundary"><div><strong>Blank prompts do not launch.</strong><br />Empty submissions are rejected before handoff.</div></div>
+        </div>
+        <aside class="note" style="margin-top: 1rem">
+          <strong>Small by design</strong>
+          <p>
+            This page does not imply a hosted dashboard, account system, cloud
+            sync, prompt marketplace, analytics layer, or broad roadmap.
+          </p>
+        </aside>
+      </section>
+
+      <section class="section-sheet" id="verification">
+        <div class="section-head">
+          <span class="chip">done means proved</span>
+          <h2>Verification checklist</h2>
+          <p>
+            The page is done when a viewer can explain where Prompt Builder fits
+            without reading the repo.
+          </p>
+        </div>
+        <div class="verify-list">
+          <article class="card">
+            <h3>Content</h3>
+            <ul>
+              <li>Frames the tool as pre-flight prompt building.</li>
+              <li>Shows shell / terminal to Prompt Builder to Codex or handoff.</li>
+              <li>Includes all five practical stories.</li>
+              <li>Includes CLI recipes and safety boundaries.</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Visual</h3>
+            <ul>
+              <li>Warm paper and tactile card surfaces.</li>
+              <li>Yolk used as a restrained accent.</li>
+              <li>Code panels readable on desktop and mobile.</li>
+              <li>Local raster infographics have alt text.</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Publish</h3>
+            <ul>
+              <li><code>index.html</code> exists at the site root.</li>
+              <li>Image paths resolve locally and on here.now.</li>
+              <li>No local filesystem paths appear in HTML.</li>
+              <li>Published URL returns HTTP 200.</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="wrap">
+      Built from the local Prompt Builder repo, Oracle's packx-backed explainer
+      plan, generated user-story infographics, and the here.now egghead
+      day-shift brand snapshot.
+    </footer>
+  </body>
+</html>
