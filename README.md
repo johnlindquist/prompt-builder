@@ -108,8 +108,9 @@ printf 'explain this\n' | prompt-builder --stdin --print-prompt
 | Key | Action |
 | --- | --- |
 | `Enter` | Submit the prompt |
+| `Cmd+Enter` | Submit from any focused field (terminals with the kitty keyboard protocol) |
 | `Shift+Enter` / `Ctrl+J` | Insert newline |
-| `Tab` | Move focus Name → Prompt → flow inputs → target → flow → options |
+| `Tab` | Move focus Name → Prompt → flow inputs → target → flow → `-i` → options |
 | `Space` / `←` / `→` | Cycle the focused target or flow selector |
 | `Enter` on `Target ‹name›` | Open the target manager popup |
 | `Enter` on `Flow ‹name›` | Open the fuzzy flow picker (mdflow) |
@@ -243,6 +244,10 @@ letting the flow's own frontmatter pick the engine.
   `--_name=value` flags; your prompt is the first positional and fills
   `{{ _1 }}`.
 - Required fields gate submission; Enter jumps to the first empty one.
+- Tabbing onto `Flow ‹name›` opens the fuzzy picker automatically; Esc closes
+  it and leaves focus on the slot.
+- A `[ ] -i` checkbox after the flow slot toggles mdflow's interactive mode
+  (Space or Enter); when checked, the launch includes `-i`.
 - A `⚠ ignores prompt` badge warns when the selected flow never references
   `{{ _1 }}`/`{{ _prompt }}` — mdflow would silently drop your prompt text.
 - Pin a favorite flow to a target: `prompt-builder target add review

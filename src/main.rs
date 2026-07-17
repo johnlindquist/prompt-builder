@@ -142,6 +142,7 @@ fn main() -> anyhow::Result<()> {
                     .is_none()
                     .then(|| pinned_flow(&targets[initial_target]))
                     .flatten(),
+                flow_interactive: false,
             },
             cli.dry_run,
         );
@@ -427,7 +428,10 @@ fn finish_submit(
         if let Some(thread_name) = submission.thread_name.as_deref() {
             eprintln!("warning: conversation name {thread_name:?} is ignored for mdflow flows");
         }
-        let config = cli.mdflow_launch_config_for(target);
+        let mut config = cli.mdflow_launch_config_for(target);
+        if submission.flow_interactive {
+            config.args.push("-i".to_string());
+        }
         if dry_run {
             mdflow_spawn::print_command(&config, &flow.path, &flow.values, prompt);
             return Ok(());

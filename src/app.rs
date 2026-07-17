@@ -78,6 +78,8 @@ pub struct SubmittedPrompt {
     pub target: Option<Target>,
     /// mdflow flow selected for this submission; launches via mdflow when set.
     pub flow: Option<SubmittedFlow>,
+    /// Pass -i to mdflow so the flow runs in interactive mode.
+    pub flow_interactive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -520,6 +522,57 @@ fn run_inner(
                             SlashKeyOutcome::Forward => {}
                         }
                     }
+                    if is_super_enter_press(key) {
+                        if let Some(blocker) =
+                            flow_submit_blocker(&flow_state, targets.get(target_index))
+                        {
+                            composer.set_notice(blocker.message);
+                            focus = clamp_flow_focus(blocker.focus, &flow_state);
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "flow_gate",
+                                "blocked",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            continue;
+                        }
+                        let text = composer.submission_text();
+                        if text.trim().is_empty() {
+                            composer.set_notice("prompt is empty");
+                            focus = FocusTarget::Prompt;
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "app",
+                                "super_enter_empty",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            continue;
+                        }
+                        history.record(&text);
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "app",
+                            "super_enter_submit",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        return Ok(AppExit::Submit(Box::new(build_submission(
+                            text,
+                            name_input.text(),
+                            &launch_options,
+                            targets.get(target_index),
+                            &flow_state,
+                            &header.cwd,
+                        ))));
+                    }
                     if is_esc_press(key) {
                         if focus == FocusTarget::Prompt {
                             let draft = composer.submission_text();
@@ -565,6 +618,20 @@ fn run_inner(
                             (focus.next(ctx), "focus_next")
                         };
                         focus = next_focus;
+                        // Landing on the flow selector means the user wants to
+                        // pick a flow — open the picker without requiring Enter.
+                        if focus == FocusTarget::FlowSelect {
+                            skill_popup = None;
+                            file_popup = None;
+                            slash_popup = None;
+                            if matches!(flow_state.catalog, CatalogState::Loaded(_)) {
+                                flow_popup =
+                                    Some(FlowPopup::new(flow_state.selected, flow_state.flows()));
+                            } else {
+                                composer.set_notice("loading flows…");
+                                pending_flow_intent = Some(PendingFlowIntent::OpenPicker);
+                            }
+                        }
                         log_key_debug(
                             &mut key_debug,
                             focus,
@@ -752,6 +819,32 @@ fn run_inner(
                         );
                         continue;
                     }
+                    if focus == FocusTarget::FlowInteractive {
+                        if matches!(
+                            key.kind,
+                            event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                        ) && matches!(
+                            key.code,
+                            KeyCode::Char(' ')
+                                | KeyCode::Enter
+                                | KeyCode::Left
+                                | KeyCode::Right
+                                | KeyCode::Up
+                                | KeyCode::Down
+                        ) {
+                            flow_state.interactive = !flow_state.interactive;
+                        }
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "flow_interactive",
+                            "handled",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
                     if let FocusTarget::Options(index) = focus {
                         if matches!(
                             key.kind,
@@ -844,26 +937,14 @@ fn run_inner(
                                 lines_before,
                                 composer_line_count(&composer),
                             );
-                            let conversation_name = submitted_conversation_name(name_input.text());
-                            let thread_name = conversation_name.as_deref().and_then(|name| {
-                                prefixed_thread_name(name, &cwd_name_prefix(&header.cwd))
-                            });
-                            return Ok(AppExit::Submit(Box::new(SubmittedPrompt {
-                                prompt: text,
-                                conversation_name,
-                                thread_name,
-                                toggled_argv: enabled_option_argv(&launch_options),
-                                target: targets.get(target_index).cloned(),
-                                flow: flow_state.selected_flow().map(|entry| SubmittedFlow {
-                                    path: entry.path.clone(),
-                                    name: entry.name.clone(),
-                                    values: flow_state
-                                        .form
-                                        .as_ref()
-                                        .map(FlowForm::values)
-                                        .unwrap_or_default(),
-                                }),
-                            })));
+                            return Ok(AppExit::Submit(Box::new(build_submission(
+                                text,
+                                name_input.text(),
+                                &launch_options,
+                                targets.get(target_index),
+                                &flow_state,
+                                &header.cwd,
+                            ))));
                         }
                         ComposerAction::None => {
                             log_key_debug(
@@ -914,6 +995,7 @@ fn run_inner(
                         }
                         FocusTarget::TargetSelect
                         | FocusTarget::FlowSelect
+                        | FocusTarget::FlowInteractive
                         | FocusTarget::Options(_) => {}
                     }
                     log_event_debug(
@@ -1359,6 +1441,18 @@ fn is_plain_enter_press(key: KeyEvent) -> bool {
         && key.modifiers.is_empty()
 }
 
+/// Cmd+Enter (SUPER under the kitty protocol; some terminals report META):
+/// submit from any focus. Ctrl+Enter stays a composer newline.
+fn is_super_enter_press(key: KeyEvent) -> bool {
+    matches!(
+        key.kind,
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+    ) && key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+}
+
 #[derive(Debug)]
 struct KeyDebug {
     file: File,
@@ -1525,6 +1619,7 @@ fn hint_items_for(focus: FocusTarget) -> Vec<(&'static str, &'static str)> {
             ("Tab", "field"),
             ("Enter", "next"),
             ("Space", "toggle"),
+            ("Cmd+Enter", "send"),
             ("Esc", "prompt"),
             ("Ctrl+C", "quit"),
         ],
@@ -1540,6 +1635,14 @@ fn hint_items_for(focus: FocusTarget) -> Vec<(&'static str, &'static str)> {
             ("Tab", "field"),
             ("←/→", "flow"),
             ("Enter", "flows"),
+            ("Cmd+Enter", "send"),
+            ("Esc", "prompt"),
+            ("Ctrl+C", "quit"),
+        ],
+        FocusTarget::FlowInteractive => vec![
+            ("Space", "toggle -i"),
+            ("Tab", "field"),
+            ("Cmd+Enter", "send"),
             ("Esc", "prompt"),
             ("Ctrl+C", "quit"),
         ],
@@ -1619,6 +1722,8 @@ enum FocusTarget {
     FlowInput(usize),
     TargetSelect,
     FlowSelect,
+    /// The mdflow `-i` interactive-mode checkbox next to the flow slot.
+    FlowInteractive,
     Options(usize),
 }
 
@@ -1644,7 +1749,8 @@ impl FocusTarget {
             Self::FlowInput(_) => Self::after_flow_inputs(ctx),
             Self::TargetSelect if ctx.has_flow_select => Self::FlowSelect,
             Self::TargetSelect => Self::after_flow_select(ctx),
-            Self::FlowSelect => Self::after_flow_select(ctx),
+            Self::FlowSelect => Self::FlowInteractive,
+            Self::FlowInteractive => Self::after_flow_select(ctx),
             Self::Options(index) if index + 1 < ctx.option_count => Self::Options(index + 1),
             Self::Options(_) => Self::Name,
         }
@@ -1653,7 +1759,7 @@ impl FocusTarget {
     fn prev(self, ctx: FocusContext) -> Self {
         match self {
             Self::Name if ctx.option_count > 0 => Self::Options(ctx.option_count - 1),
-            Self::Name if ctx.has_flow_select => Self::FlowSelect,
+            Self::Name if ctx.has_flow_select => Self::FlowInteractive,
             Self::Name if ctx.has_target_select => Self::TargetSelect,
             Self::Name if ctx.flow_field_count > 0 => Self::FlowInput(ctx.flow_field_count - 1),
             Self::Name => Self::Prompt,
@@ -1669,7 +1775,8 @@ impl FocusTarget {
                 Self::FlowInput(ctx.flow_field_count - 1)
             }
             Self::FlowSelect => Self::Prompt,
-            Self::Options(0) if ctx.has_flow_select => Self::FlowSelect,
+            Self::FlowInteractive => Self::FlowSelect,
+            Self::Options(0) if ctx.has_flow_select => Self::FlowInteractive,
             Self::Options(0) if ctx.has_target_select => Self::TargetSelect,
             Self::Options(0) if ctx.flow_field_count > 0 => {
                 Self::FlowInput(ctx.flow_field_count - 1)
@@ -1729,6 +1836,8 @@ struct FlowState {
     /// Explain queued until after the next draw, so a loading notice paints
     /// first and rapid cycling coalesces into one fetch.
     pending_explain: bool,
+    /// Pass -i so the launched flow runs in mdflow's interactive mode.
+    interactive: bool,
 }
 
 impl FlowState {
@@ -1746,6 +1855,7 @@ impl FlowState {
             form_cache: std::collections::HashMap::new(),
             explain_error: None,
             pending_explain: false,
+            interactive: false,
         }
     }
 
@@ -1866,6 +1976,37 @@ impl FlowState {
 struct FlowSubmitBlocker {
     message: String,
     focus: FocusTarget,
+}
+
+fn build_submission(
+    prompt: String,
+    name_text: &str,
+    launch_options: &[ToggleOption],
+    target: Option<&Target>,
+    flow_state: &FlowState,
+    cwd: &str,
+) -> SubmittedPrompt {
+    let conversation_name = submitted_conversation_name(name_text);
+    let thread_name = conversation_name
+        .as_deref()
+        .and_then(|name| prefixed_thread_name(name, &cwd_name_prefix(cwd)));
+    SubmittedPrompt {
+        prompt,
+        conversation_name,
+        thread_name,
+        toggled_argv: enabled_option_argv(launch_options),
+        target: target.cloned(),
+        flow: flow_state.selected_flow().map(|entry| SubmittedFlow {
+            path: entry.path.clone(),
+            name: entry.name.clone(),
+            values: flow_state
+                .form
+                .as_ref()
+                .map(FlowForm::values)
+                .unwrap_or_default(),
+        }),
+        flow_interactive: flow_state.interactive,
+    }
 }
 
 fn flow_submit_blocker(
@@ -2177,6 +2318,10 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
             label: flow_slot_label.as_str(),
             focused: focus == FocusTarget::FlowSelect,
             ignores_prompt: flow_ignores_prompt,
+            interactive: (
+                flow_state.interactive,
+                focus == FocusTarget::FlowInteractive,
+            ),
         });
         render_launch_options(
             input_rows[4],
@@ -2212,7 +2357,10 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
                 .form
                 .as_ref()
                 .and_then(|form| form.cursor_pos(input_rows[3], index)),
-            FocusTarget::TargetSelect | FocusTarget::FlowSelect | FocusTarget::Options(_) => None,
+            FocusTarget::TargetSelect
+            | FocusTarget::FlowSelect
+            | FocusTarget::FlowInteractive
+            | FocusTarget::Options(_) => None,
         }
     };
     if let Some((x, y)) = cursor {
@@ -2232,6 +2380,8 @@ struct FlowSlotView<'a> {
     focused: bool,
     /// True when the selected flow never references the composed prompt.
     ignores_prompt: bool,
+    /// The mdflow -i checkbox: (enabled, focused).
+    interactive: (bool, bool),
 }
 
 fn render_launch_options(
@@ -2275,6 +2425,19 @@ fn render_launch_options(
             spans.push(Span::styled(label, theme.muted_style()));
         } else {
             spans.push(Span::styled(label, theme.text_style()));
+        }
+        let (interactive_enabled, interactive_focused) = flow.interactive;
+        let checkbox = if interactive_enabled {
+            " [x] -i"
+        } else {
+            " [ ] -i"
+        };
+        if interactive_focused {
+            spans.push(Span::styled(checkbox, theme.selected_style()));
+        } else if interactive_enabled {
+            spans.push(Span::styled(checkbox, theme.text_style()));
+        } else {
+            spans.push(Span::styled(checkbox, theme.muted_style()));
         }
         if flow.ignores_prompt {
             spans.push(Span::styled(" ⚠ ignores prompt", theme.warning_style()));
@@ -3029,6 +3192,19 @@ mod tests {
     }
 
     #[test]
+    fn super_enter_matches_cmd_but_not_plain_or_ctrl_enter() {
+        let cmd = KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER);
+        let meta = KeyEvent::new(KeyCode::Enter, KeyModifiers::META);
+        let plain = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let ctrl = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+
+        assert!(is_super_enter_press(cmd));
+        assert!(is_super_enter_press(meta));
+        assert!(!is_super_enter_press(plain));
+        assert!(!is_super_enter_press(ctrl));
+    }
+
+    #[test]
     fn ctrl_c_release_is_ignored() {
         let release = KeyEvent::new_with_kind(
             KeyCode::Char('c'),
@@ -3155,6 +3331,10 @@ mod tests {
         );
         assert_eq!(
             FocusTarget::FlowSelect.next(context),
+            FocusTarget::FlowInteractive
+        );
+        assert_eq!(
+            FocusTarget::FlowInteractive.next(context),
             FocusTarget::Options(0)
         );
         assert_eq!(FocusTarget::Options(0).next(context), FocusTarget::Name);
@@ -3179,6 +3359,7 @@ mod tests {
                         }
                         if has_flow_select {
                             targets.push(FocusTarget::FlowSelect);
+                            targets.push(FocusTarget::FlowInteractive);
                         }
                         targets.extend((0..option_count).map(FocusTarget::Options));
                         for focus in targets {
