@@ -170,6 +170,9 @@ fn render_target_row(
     if let Some(profile) = &target.profile {
         summary.push_str(&format!("  profile={profile}"));
     }
+    if let Some(flow) = &target.flow {
+        summary.push_str(&format!("  flow={flow}"));
+    }
     for key in target.env.keys() {
         summary.push_str(&format!("  {key}"));
     }

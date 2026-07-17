@@ -109,9 +109,10 @@ printf 'explain this\n' | prompt-builder --stdin --print-prompt
 | --- | --- |
 | `Enter` | Submit the prompt |
 | `Shift+Enter` / `Ctrl+J` | Insert newline |
-| `Tab` | Move focus Name → Prompt → target → options |
-| `Space` / `←` / `→` | Cycle the focused target selector |
+| `Tab` | Move focus Name → Prompt → flow inputs → target → flow → options |
+| `Space` / `←` / `→` | Cycle the focused target or flow selector |
 | `Enter` on `Target ‹name›` | Open the target manager popup |
+| `Enter` on `Flow ‹name›` | Open the fuzzy flow picker (mdflow) |
 | `Ctrl+G` on `Target ‹name›` | Edit `targets.toml` in `$VISUAL`/`$EDITOR` |
 | `@` | Fuzzy file search popup (inserts the path) |
 | `/` | Slash command popup (first line only) |
@@ -144,7 +145,7 @@ disable project-local discovery.
 
 ## Targets (Profiles)
 
-A target names a launcher: Pi, Codex, or Claude Code, plus the binary,
+A target names a launcher: Pi, Codex, Claude Code, or mdflow, plus the binary,
 environment variables, and default options it should use. Targets make it easy
 to keep several agent profiles side by side (for example `PI_CODING_AGENT_DIR`,
 `CODEX_HOME`, or `CLAUDE_CONFIG_DIR` variants).
@@ -198,8 +199,9 @@ CLAUDE_CONFIG_DIR = "~/.claude-second"
 
 Each target supports `name`, `kind` (`pi`, `codex`, or `claude`), `bin`
 (executable override), `env` (launch environment; `~/` expands to the home directory),
-`model`, `args` (extra argv before the prompt), and for Codex targets
-`profile` and `config` (repeatable `-c` overrides). CLI flags win over target
+`model`, `args` (extra argv before the prompt), for Codex targets
+`profile` and `config` (repeatable `-c` overrides), and for mdflow targets
+`flow` (path to a pinned flow file). CLI flags win over target
 values; target `config` entries come first so CLI `-c` entries override them.
 
 Pick a target with `--target`/`-t`, or in the TUI: a `Target ‹name›`
@@ -223,6 +225,30 @@ the commit is refused — press `r` to reload, then re-apply your edit.
 prompt-builder --target claude "explain this repo"
 prompt-builder -t egghead --submit --dry-run "fix it"
 ```
+
+## mdflow Flows
+
+When the [mdflow](https://github.com/johnlindquist/mdflow) CLI is on `PATH`
+(or any `kind = "mdflow"` target exists), a `Flow ‹name›` selector appears
+next to the target selector. Flows are markdown prompt templates; selecting
+one wraps your composed prompt in the flow and launches it through `mdflow`,
+letting the flow's own frontmatter pick the engine.
+
+- Space/arrows cycle discovered flows (`mdflow catalog`); Enter opens a fuzzy
+  picker (type to filter, `Ctrl+R` reloads the catalog, row one is always
+  `No flow`).
+- Selecting a flow renders its `_inputs` and unfilled template vars as form
+  fields between the composer and the options row: text and number fields
+  edit inline, selects and confirms cycle with Space. Values launch as
+  `--_name=value` flags; your prompt is the first positional and fills
+  `{{ _1 }}`.
+- Required fields gate submission; Enter jumps to the first empty one.
+- A `⚠ ignores prompt` badge warns when the selected flow never references
+  `{{ _1 }}`/`{{ _prompt }}` — mdflow would silently drop your prompt text.
+- Pin a favorite flow to a target: `prompt-builder target add review
+  --kind mdflow --flow flows/review.md`. Launching that target uses the pin
+  even with the Flow slot on `No flow`; a flow chosen in the slot always wins,
+  under any target kind.
 
 The first target in the file is the default. Fresh or empty configurations use
 Pi first. Existing non-empty `targets.toml` files remain authoritative and are

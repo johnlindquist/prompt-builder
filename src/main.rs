@@ -7,10 +7,15 @@ mod composer_input;
 mod external_editor;
 mod file_popup;
 mod file_search;
+mod flow;
+mod flow_form;
+mod flow_popup;
 mod handoff;
 mod herdr;
 mod history;
 mod launch_manifest;
+mod line_input;
+mod mdflow_spawn;
 mod pi_spawn;
 mod skill_popup;
 mod skills;
@@ -27,6 +32,7 @@ use anyhow::Context;
 use clap::Parser;
 
 use crate::app::AppExit;
+use crate::app::SubmittedFlow;
 use crate::app::SubmittedPrompt;
 use crate::app::TemplateInfo;
 use crate::cli::enabled_option_argv;
@@ -90,7 +96,7 @@ fn main() -> anyhow::Result<()> {
                 &targets[initial_target],
                 &prompt,
                 thread_name.as_deref(),
-            );
+            )?;
         }
     }
     if cli.print_launch_json {
@@ -112,7 +118,7 @@ fn main() -> anyhow::Result<()> {
                     &targets[initial_target],
                     &prompt,
                     thread_name.as_deref(),
-                )
+                )?
             );
         }
     }
@@ -132,6 +138,10 @@ fn main() -> anyhow::Result<()> {
                 target: handoff_config
                     .is_none()
                     .then(|| targets[initial_target].clone()),
+                flow: handoff_config
+                    .is_none()
+                    .then(|| pinned_flow(&targets[initial_target]))
+                    .flatten(),
             },
             cli.dry_run,
         );
@@ -158,6 +168,7 @@ fn main() -> anyhow::Result<()> {
         toggle_options,
         tui_targets,
         initial_target,
+        cli.mdflow_bin.clone(),
         loaded_theme,
         cli.debug_keys.clone(),
     )? {
@@ -240,6 +251,9 @@ fn describe_target(target: &Target) -> String {
     if !target.args.is_empty() {
         line.push_str(&format!("\targs={}", target.args.join(" ")));
     }
+    if let Some(flow) = &target.flow {
+        line.push_str(&format!("\tflow={flow}"));
+    }
     line
 }
 
@@ -260,7 +274,12 @@ fn resolve_target_index(targets: &[Target], name: Option<&str>) -> anyhow::Resul
         })
 }
 
-fn print_default_command(cli: &Cli, target: &Target, prompt: &str, thread_name: Option<&str>) {
+fn print_default_command(
+    cli: &Cli,
+    target: &Target,
+    prompt: &str,
+    thread_name: Option<&str>,
+) -> anyhow::Result<()> {
     match target.kind {
         TargetKind::Pi => {
             pi_spawn::print_command(&cli.pi_launch_config_for(target), prompt, thread_name)
@@ -275,7 +294,17 @@ fn print_default_command(cli: &Cli, target: &Target, prompt: &str, thread_name: 
                 None => codex_spawn::print_command(&config, prompt, None),
             }
         }
+        TargetKind::Mdflow => {
+            let flow = require_pinned_flow(target)?;
+            mdflow_spawn::print_command(
+                &cli.mdflow_launch_config_for(target),
+                &flow.path,
+                &flow.values,
+                prompt,
+            );
+        }
     }
+    Ok(())
 }
 
 fn default_launch_json_for(
@@ -283,8 +312,8 @@ fn default_launch_json_for(
     target: &Target,
     prompt: &str,
     thread_name: Option<&str>,
-) -> String {
-    match target.kind {
+) -> anyhow::Result<String> {
+    Ok(match target.kind {
         TargetKind::Pi => {
             launch_manifest::pi_launch_json(&cli.pi_launch_config_for(target), prompt, thread_name)
         }
@@ -296,7 +325,44 @@ fn default_launch_json_for(
             prompt,
             thread_name,
         ),
+        TargetKind::Mdflow => {
+            let flow = require_pinned_flow(target)?;
+            launch_manifest::mdflow_launch_json(
+                &cli.mdflow_launch_config_for(target),
+                &flow.path,
+                &flow.values,
+                prompt,
+            )
+        }
+    })
+}
+
+/// Flow name shown in headers and history: the file stem of the flow path.
+fn flow_display_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn pinned_flow(target: &Target) -> Option<SubmittedFlow> {
+    if target.kind != TargetKind::Mdflow {
+        return None;
     }
+    target.flow.as_ref().map(|path| SubmittedFlow {
+        path: path.clone(),
+        name: flow_display_name(path),
+        values: Vec::new(),
+    })
+}
+
+fn require_pinned_flow(target: &Target) -> anyhow::Result<SubmittedFlow> {
+    pinned_flow(target).with_context(|| {
+        format!(
+            "mdflow target {:?} has no pinned flow; add flow = \"path\" in targets.toml",
+            target.name
+        )
+    })
 }
 
 fn finish_submit(
@@ -335,6 +401,41 @@ fn finish_submit(
         .target
         .as_ref()
         .context("submission did not include a launch target")?;
+    // A selected flow launches through mdflow no matter which target is
+    // active; the flow's own frontmatter decides the engine.
+    let pinned;
+    let effective_flow = match &submission.flow {
+        Some(flow) => Some(flow),
+        None if target.kind == TargetKind::Mdflow => {
+            pinned = pinned_flow(target);
+            pinned.as_ref()
+        }
+        None => None,
+    };
+    if let Some(flow) = effective_flow {
+        let ignored = cli.codex_only_options_in_use();
+        if !ignored.is_empty() {
+            eprintln!(
+                "warning: {} ignored for mdflow flow {:?}",
+                ignored.join(", "),
+                flow.name
+            );
+        }
+        if cli.model.is_some() {
+            eprintln!("warning: --model ignored for mdflow flow {:?}", flow.name);
+        }
+        if let Some(thread_name) = submission.thread_name.as_deref() {
+            eprintln!("warning: conversation name {thread_name:?} is ignored for mdflow flows");
+        }
+        let config = cli.mdflow_launch_config_for(target);
+        if dry_run {
+            mdflow_spawn::print_command(&config, &flow.path, &flow.values, prompt);
+            return Ok(());
+        }
+        return launch_with_herdr_tab_name(submission.conversation_name.as_deref(), || {
+            mdflow_spawn::launch(&config, &flow.path, &flow.values, prompt)
+        });
+    }
     match target.kind {
         TargetKind::Pi => {
             let ignored = cli.codex_only_options_in_use();
@@ -396,6 +497,10 @@ fn finish_submit(
                 codex_spawn::launch(&config, prompt, None)
             })
         }
+        TargetKind::Mdflow => anyhow::bail!(
+            "mdflow target {:?} requires a flow: set flow = \"path\" in targets.toml or pick one in the TUI Flow slot",
+            target.name
+        ),
     }
 }
 

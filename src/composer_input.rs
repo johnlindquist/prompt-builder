@@ -16,6 +16,7 @@ use crate::file_search::AtToken;
 use crate::slash_commands;
 use crate::theme::Theme;
 
+use std::cell::Cell;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -69,6 +70,16 @@ impl PasteBurst {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlainEnterOutcome {
+    /// A paste burst turned Enter into a newline; the key is consumed.
+    InsertedNewline,
+    /// Nothing to submit; the key is consumed with no effect.
+    EmptyDraft,
+    /// input() would return Submitted for this Enter.
+    WouldSubmit,
+}
+
 pub enum ComposerAction {
     Submitted(String),
     None,
@@ -101,6 +112,8 @@ pub struct ComposerInput {
     notice: Option<String>,
     title: Option<String>,
     paste_burst: PasteBurst,
+    content_width: Cell<usize>,
+    preferred_visual_position: Option<(usize, usize)>,
 }
 
 impl ComposerInput {
@@ -112,6 +125,8 @@ impl ComposerInput {
             notice: None,
             title: None,
             paste_burst: PasteBurst::default(),
+            content_width: Cell::new(1),
+            preferred_visual_position: None,
         }
     }
 
@@ -135,12 +150,32 @@ impl ComposerInput {
         self.input_at(key, Instant::now())
     }
 
+    /// Plain-Enter handling for app-level submit gating. Consumes the Enter
+    /// exactly like input() does when it would NOT submit (paste-burst
+    /// newline, empty draft), and otherwise reports that a submit would fire
+    /// while leaving pending-paste state intact so the caller can block the
+    /// submission without corrupting placeholders.
+    pub fn plain_enter_gate(&mut self) -> PlainEnterOutcome {
+        let now = Instant::now();
+        if self.paste_burst.newline_instead_of_submit(now) {
+            self.preferred_visual_position = None;
+            self.textarea.insert_newline();
+            self.reconcile_pending_pastes();
+            PlainEnterOutcome::InsertedNewline
+        } else if self.submission_text().trim().is_empty() {
+            PlainEnterOutcome::EmptyDraft
+        } else {
+            PlainEnterOutcome::WouldSubmit
+        }
+    }
+
     fn input_at(&mut self, key: KeyEvent, now: Instant) -> ComposerAction {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return ComposerAction::None;
         }
 
         if is_newline_key(key) {
+            self.preferred_visual_position = None;
             self.textarea.insert_newline();
             self.reconcile_pending_pastes();
             return ComposerAction::None;
@@ -148,6 +183,7 @@ impl ComposerInput {
 
         if key.code == KeyCode::Enter && key.modifiers.is_empty() {
             if self.paste_burst.newline_instead_of_submit(now) {
+                self.preferred_visual_position = None;
                 self.textarea.insert_newline();
                 self.reconcile_pending_pastes();
                 return ComposerAction::None;
@@ -167,9 +203,34 @@ impl ComposerInput {
         }
 
         if self.handle_placeholder_delete(key) {
+            self.preferred_visual_position = None;
             return ComposerAction::None;
         }
 
+        // tui-textarea's default redo binding is Ctrl+R, which the app claims
+        // for history search, so redo lives on Alt+R instead.
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::ALT) {
+            self.preferred_visual_position = None;
+            self.textarea.redo();
+            self.reconcile_pending_pastes();
+            return ComposerAction::None;
+        }
+
+        if key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_cursor_vertical(-1);
+                    return ComposerAction::None;
+                }
+                KeyCode::Down => {
+                    self.move_cursor_vertical(1);
+                    return ComposerAction::None;
+                }
+                _ => {}
+            }
+        }
+
+        self.preferred_visual_position = None;
         self.textarea.input(key);
         self.reconcile_pending_pastes();
         ComposerAction::None
@@ -177,6 +238,7 @@ impl ComposerInput {
 
     pub fn handle_paste(&mut self, pasted: String) -> bool {
         self.paste_burst.reset();
+        self.preferred_visual_position = None;
         let pasted = normalize_pasted_text(&pasted);
         let char_count = pasted.chars().count();
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
@@ -193,6 +255,7 @@ impl ComposerInput {
     }
 
     pub fn set_initial_text(&mut self, text: &str) {
+        self.preferred_visual_position = None;
         self.textarea.insert_str(text);
     }
 
@@ -210,6 +273,7 @@ impl ComposerInput {
     pub fn clear(&mut self) {
         self.textarea = new_textarea();
         self.pending_pastes.clear();
+        self.preferred_visual_position = None;
     }
 
     pub fn set_hint_items(&mut self, items: Vec<(impl Into<String>, impl Into<String>)>) {
@@ -221,6 +285,7 @@ impl ComposerInput {
 
     pub fn desired_height(&self, width: u16) -> u16 {
         let content_width = width.saturating_sub(2).max(1) as usize;
+        self.content_width.set(content_width);
         let text_rows = self.wrapped_rows(content_width) as u16;
         text_rows.saturating_add(3).min(MAX_COMPOSER_HEIGHT)
     }
@@ -236,6 +301,7 @@ impl ComposerInput {
         }
 
         let content_width = inner.width.max(1) as usize;
+        self.content_width.set(content_width);
         let (visual_row, visual_col) = self.visual_cursor(content_width);
         let first_visible_row = first_visible_row(visual_row, inner.height as usize);
         let visible_row = visual_row.saturating_sub(first_visible_row);
@@ -343,6 +409,10 @@ impl ComposerInput {
         file_search::current_at_token(&self.text(), self.cursor_char_index(), allow_empty)
     }
 
+    pub fn current_skill_token(&self, allow_empty: bool) -> Option<AtToken> {
+        file_search::current_dollar_token(&self.text(), self.cursor_char_index(), allow_empty)
+    }
+
     pub fn current_slash_token(&self) -> Option<SlashToken> {
         current_slash_token(&self.text(), self.cursor_char_index())
     }
@@ -435,6 +505,54 @@ impl ComposerInput {
         (rows_before + row_in_line, visual_col)
     }
 
+    pub fn is_on_first_visual_line(&self) -> bool {
+        self.visual_cursor(self.content_width.get()).0 == 0
+    }
+
+    pub fn is_on_last_visual_line(&self) -> bool {
+        let width = self.content_width.get();
+        self.visual_cursor(width).0 + 1 >= self.wrapped_rows(width)
+    }
+
+    fn move_cursor_vertical(&mut self, direction: isize) {
+        let width = self.content_width.get().max(1);
+        let rows = self.display_rows(width);
+        let (current_row, current_col) = self.visual_cursor(width);
+        let Some(target_row) = current_row.checked_add_signed(direction) else {
+            self.move_cursor_to_char_index(0);
+            self.preferred_visual_position = None;
+            return;
+        };
+        if target_row >= rows.len() {
+            self.move_cursor_to_char_index(self.text().chars().count());
+            self.preferred_visual_position = None;
+            return;
+        }
+
+        let preferred_col = self
+            .preferred_visual_position
+            .filter(|(preferred_width, _)| *preferred_width == width)
+            .map(|(_, preferred_col)| preferred_col)
+            .unwrap_or(current_col);
+        let target = &rows[target_row];
+        let target_index =
+            target.global_char_start + preferred_col.min(target.text.chars().count());
+        self.move_cursor_to_char_index(target_index);
+        self.preferred_visual_position = Some((width, preferred_col));
+    }
+
+    fn move_cursor_to_char_index(&mut self, target: usize) {
+        let current = self.cursor_char_index();
+        let (movement, count) = if target >= current {
+            (CursorMove::Forward, target - current)
+        } else {
+            (CursorMove::Back, current - target)
+        };
+        for _ in 0..count {
+            self.textarea.move_cursor(movement);
+        }
+    }
+
     fn reconcile_pending_pastes(&mut self) {
         if self.pending_pastes.is_empty() {
             return;
@@ -505,6 +623,7 @@ impl ComposerInput {
         };
         self.textarea.set_placeholder_text("Compose new task");
 
+        self.preferred_visual_position = None;
         let (row, col) = row_col_for_char_index(text, cursor_char_index);
         for _ in 0..row {
             self.textarea.move_cursor(CursorMove::Down);
@@ -776,6 +895,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn alt_r_redoes_an_undone_edit() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("hello");
+
+        composer.input(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(composer.text(), "");
+
+        composer.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT));
+        assert_eq!(composer.text(), "hello");
+    }
+
+    #[test]
+    fn current_skill_token_tracks_dollar_prefix() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("run $fus");
+
+        let token = composer.current_skill_token(false).expect("token");
+        assert_eq!(token.query, "fus");
+        assert_eq!((token.start, token.end), (4, 8));
+    }
+
+    #[test]
     fn large_paste_inserts_placeholder_and_expands_on_submit() {
         let mut composer = ComposerInput::new();
         let pasted = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
@@ -930,6 +1071,48 @@ mod tests {
 
         assert_eq!(wrap_line("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(composer.visual_cursor(4), (2, 2));
+    }
+
+    #[test]
+    fn arrows_move_between_wrapped_visual_lines() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("abcdefghij");
+        composer.desired_height(6); // Four columns inside the border.
+
+        composer.input(KeyEvent::from(KeyCode::Up));
+        assert_eq!(composer.cursor_char_index(), 6);
+        composer.input(KeyEvent::from(KeyCode::Up));
+        assert_eq!(composer.cursor_char_index(), 2);
+        composer.input(KeyEvent::from(KeyCode::Down));
+        assert_eq!(composer.cursor_char_index(), 6);
+    }
+
+    #[test]
+    fn vertical_movement_keeps_preferred_column_across_short_lines() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("abcdef\nx\nabcdef");
+        composer.desired_height(12);
+
+        composer.input(KeyEvent::from(KeyCode::Up));
+        assert_eq!(composer.cursor_char_index(), 8);
+        composer.input(KeyEvent::from(KeyCode::Up));
+        assert_eq!(composer.cursor_char_index(), 6);
+        composer.input(KeyEvent::from(KeyCode::Down));
+        assert_eq!(composer.cursor_char_index(), 8);
+        composer.input(KeyEvent::from(KeyCode::Down));
+        assert_eq!(composer.cursor_char_index(), 15);
+    }
+
+    #[test]
+    fn vertical_movement_at_edges_jumps_to_text_boundary() {
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("abc");
+        composer.desired_height(12);
+
+        composer.input(KeyEvent::from(KeyCode::Up));
+        assert_eq!(composer.cursor_char_index(), 0);
+        composer.input(KeyEvent::from(KeyCode::Down));
+        assert_eq!(composer.cursor_char_index(), 3);
     }
 
     #[test]

@@ -39,10 +39,17 @@ use crate::cli::ToggleOption;
 use crate::composer_input::normalize_key_for_binding;
 use crate::composer_input::ComposerAction;
 use crate::composer_input::ComposerInput;
+use crate::composer_input::PlainEnterOutcome;
 use crate::file_popup::FilePopup;
 use crate::file_popup::FilePopupAction;
 use crate::file_search;
+use crate::flow::FlowEntry;
+use crate::flow_form::FlowForm;
+use crate::flow_popup::FlowPopup;
+use crate::flow_popup::FlowPopupAction;
 use crate::history::History;
+use crate::line_input::clear_area;
+use crate::line_input::LineInput;
 use crate::skill_popup::SkillPopup;
 use crate::skill_popup::SkillPopupAction;
 use crate::skills::Skill;
@@ -51,6 +58,7 @@ use crate::slash_popup::SlashPopupAction;
 use crate::target_popup::TargetPopup;
 use crate::target_popup::TargetPopupAction;
 use crate::targets::Target;
+use crate::targets::TargetKind;
 use crate::theme::LoadedTheme;
 use crate::theme::Theme;
 
@@ -68,6 +76,16 @@ pub struct SubmittedPrompt {
     pub thread_name: Option<String>,
     pub toggled_argv: Vec<String>,
     pub target: Option<Target>,
+    /// mdflow flow selected for this submission; launches via mdflow when set.
+    pub flow: Option<SubmittedFlow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmittedFlow {
+    pub path: String,
+    pub name: String,
+    /// Collected template-var values passed as --_name=value.
+    pub values: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -98,6 +116,7 @@ pub fn run(
     launch_options: Vec<ToggleOption>,
     targets: Vec<Target>,
     initial_target: usize,
+    mdflow_bin: String,
     loaded_theme: LoadedTheme,
     debug_keys: Option<PathBuf>,
 ) -> anyhow::Result<AppExit> {
@@ -112,6 +131,7 @@ pub fn run(
         launch_options,
         targets,
         initial_target,
+        mdflow_bin,
         loaded_theme,
         debug_keys,
     );
@@ -132,6 +152,7 @@ fn run_inner(
     mut launch_options: Vec<ToggleOption>,
     mut targets: Vec<Target>,
     initial_target: usize,
+    mdflow_bin: String,
     loaded_theme: LoadedTheme,
     debug_keys: Option<PathBuf>,
 ) -> anyhow::Result<AppExit> {
@@ -139,23 +160,18 @@ fn run_inner(
     let mut target_index = initial_target.min(targets.len().saturating_sub(1));
     let mut target_popup: Option<TargetPopup> = None;
     let mut pending_target_edit: Option<PendingTargetEdit> = None;
+    let mut flow_state = FlowState::new(mdflow_bin, &targets);
+    let mut flow_popup: Option<FlowPopup> = None;
+    let mut pending_flow_intent: Option<PendingFlowIntent> = None;
     let mut composer = ComposerInput::new();
     if let Some(diagnostic) = loaded_theme.diagnostic {
         composer.set_notice(diagnostic);
     }
-    composer.set_hint_items(vec![
-        ("Tab", "field"),
-        ("Enter", "send"),
-        ("Shift+Enter", "newline"),
-        ("↑", "history"),
-        ("Ctrl+R", "search"),
-        ("Ctrl+G", "editor"),
-        ("Ctrl+C", "quit"),
-    ]);
+    composer.set_hint_items(hint_items_for(initial_focus()));
     if !initial_prompt.is_empty() {
         composer.set_initial_text(&initial_prompt);
     }
-    let mut name_input = NameInput::new();
+    let mut name_input = LineInput::new("Name", "Optional conversation name");
     name_input.set_text(&initial_name);
     let mut focus = initial_focus();
     let mut skill_mentions = skills.iter().map(Skill::mention).collect::<Vec<_>>();
@@ -172,6 +188,7 @@ fn run_inner(
     }
 
     loop {
+        composer.set_hint_items(hint_items_for(focus));
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -188,11 +205,36 @@ fn run_inner(
                     targets: &targets,
                     target_index,
                     target_popup: target_popup.as_ref(),
+                    flow_state: &flow_state,
+                    flow_popup: flow_popup.as_ref(),
                     theme: &theme,
                     skill_mentions: &skill_mentions,
                 },
             )
         })?;
+
+        if let Some(intent) = pending_flow_intent.take() {
+            composer.clear_notice();
+            match flow_state.load_catalog(&header.cwd_path) {
+                Ok(()) => match intent {
+                    PendingFlowIntent::OpenPicker => {
+                        flow_popup = Some(FlowPopup::new(flow_state.selected, flow_state.flows()));
+                    }
+                    PendingFlowIntent::Cycle(step) => flow_state.cycle(step),
+                },
+                Err(err) => composer.set_notice(format!("flows: {err}")),
+            }
+            focus = clamp_flow_focus(focus, &flow_state);
+            continue;
+        }
+
+        if flow_state.pending_explain {
+            if let Err(err) = flow_state.run_pending_explain(&header.cwd_path) {
+                composer.set_notice(format!("flow inputs: {err}"));
+            }
+            focus = clamp_flow_focus(focus, &flow_state);
+            continue;
+        }
 
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -258,6 +300,49 @@ fn run_inner(
                             focus,
                             key,
                             "target_popup",
+                            "handled",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if flow_popup.is_some() {
+                        let action = flow_popup
+                            .as_mut()
+                            .map(|popup| popup.handle_key(key, flow_state.flows()))
+                            .unwrap_or(FlowPopupAction::None);
+                        match action {
+                            FlowPopupAction::None => {}
+                            FlowPopupAction::Cancel => flow_popup = None,
+                            FlowPopupAction::Accept(row) => {
+                                flow_state.select(row);
+                                if flow_state.pending_explain {
+                                    composer.set_notice("loading flow inputs…");
+                                }
+                                flow_popup = None;
+                                focus = clamp_flow_focus(focus, &flow_state);
+                            }
+                            FlowPopupAction::Reload => {
+                                flow_state.form_cache.clear();
+                                match flow_state.load_catalog(&header.cwd_path) {
+                                    Ok(()) => {
+                                        if let Some(popup) = flow_popup.as_mut() {
+                                            popup.set_notice("flows reloaded");
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if let Some(popup) = flow_popup.as_mut() {
+                                            popup.set_notice(format!("reload: {err}"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "flow_popup",
                             "handled",
                             lines_before,
                             composer_line_count(&composer),
@@ -334,6 +419,24 @@ fn run_inner(
                         return Ok(AppExit::Cancel);
                     }
                     if is_ctrl_c_press(key) {
+                        if let FocusTarget::FlowInput(index) = focus {
+                            if flow_state
+                                .form
+                                .as_mut()
+                                .is_some_and(|form| form.clear_field(index))
+                            {
+                                log_key_debug(
+                                    &mut key_debug,
+                                    focus,
+                                    key,
+                                    "flow_input",
+                                    "clear",
+                                    lines_before,
+                                    composer_line_count(&composer),
+                                );
+                                continue;
+                            }
+                        }
                         let draft = composer.submission_text();
                         if handle_ctrl_c(&mut name_input, &mut composer, focus) {
                             log_key_debug(
@@ -365,9 +468,10 @@ fn run_inner(
                         );
                         continue;
                     }
-                    if let Some(popup) = skill_popup.as_mut() {
-                        match popup.handle_key(key, &skills) {
-                            SkillPopupAction::None => {
+                    if skill_popup.is_some() {
+                        match handle_skill_popup_key(&mut skill_popup, &mut composer, &skills, key)
+                        {
+                            SkillKeyOutcome::Handled => {
                                 log_key_debug(
                                     &mut key_debug,
                                     focus,
@@ -379,34 +483,7 @@ fn run_inner(
                                 );
                                 continue;
                             }
-                            SkillPopupAction::Cancel => {
-                                skill_popup = None;
-                                log_key_debug(
-                                    &mut key_debug,
-                                    focus,
-                                    key,
-                                    "skill_popup",
-                                    "cancel",
-                                    lines_before,
-                                    composer_line_count(&composer),
-                                );
-                                continue;
-                            }
-                            SkillPopupAction::Insert(text) => {
-                                skill_popup = None;
-                                insert_text(&mut composer, &text);
-                                log_key_debug(
-                                    &mut key_debug,
-                                    focus,
-                                    key,
-                                    "skill_popup",
-                                    "insert",
-                                    lines_before,
-                                    composer_line_count(&composer),
-                                );
-                                continue;
-                            }
-                            SkillPopupAction::Forward => {}
+                            SkillKeyOutcome::Forward => {}
                         }
                     }
                     if file_popup.is_some() {
@@ -443,14 +520,57 @@ fn run_inner(
                             SlashKeyOutcome::Forward => {}
                         }
                     }
+                    if is_esc_press(key) {
+                        if focus == FocusTarget::Prompt {
+                            let draft = composer.submission_text();
+                            if !draft.trim().is_empty() {
+                                // Like Ctrl+C, a cleared draft stays recoverable
+                                // via Up-arrow history.
+                                history.record(&draft);
+                                composer.clear();
+                            }
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "app",
+                                "esc_clear",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                        } else {
+                            focus = FocusTarget::Prompt;
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "app",
+                                "esc_focus_prompt",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                        }
+                        continue;
+                    }
                     if is_tab_press(key) {
-                        focus = focus.next(launch_options.len(), !targets.is_empty());
+                        let ctx = FocusContext {
+                            flow_field_count: flow_state.form_field_count(),
+                            has_target_select: !targets.is_empty(),
+                            has_flow_select: flow_state.available && !targets.is_empty(),
+                            option_count: launch_options.len(),
+                        };
+                        let (next_focus, action) = if is_back_tab_press(key) {
+                            (focus.prev(ctx), "focus_prev")
+                        } else {
+                            (focus.next(ctx), "focus_next")
+                        };
+                        focus = next_focus;
                         log_key_debug(
                             &mut key_debug,
                             focus,
                             key,
                             "app",
-                            "focus_next",
+                            action,
                             lines_before,
                             composer_line_count(&composer),
                         );
@@ -478,6 +598,40 @@ fn run_inner(
                             focus,
                             key,
                             "name",
+                            "input",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if let FocusTarget::FlowInput(index) = focus {
+                        if is_plain_enter_press(key) {
+                            let ctx = FocusContext {
+                                flow_field_count: flow_state.form_field_count(),
+                                has_target_select: !targets.is_empty(),
+                                has_flow_select: flow_state.available && !targets.is_empty(),
+                                option_count: launch_options.len(),
+                            };
+                            focus = focus.next(ctx);
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "flow_input",
+                                "focus_next",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            continue;
+                        }
+                        if let Some(form) = flow_state.form.as_mut() {
+                            form.handle_key(index, key);
+                        }
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "flow_input",
                             "input",
                             lines_before,
                             composer_line_count(&composer),
@@ -527,6 +681,7 @@ fn run_inner(
                                     skill_popup = None;
                                     file_popup = None;
                                     slash_popup = None;
+                                    flow_popup = None;
                                     target_popup =
                                         Some(TargetPopup::new(target_index, targets.len()));
                                 }
@@ -544,27 +699,88 @@ fn run_inner(
                         );
                         continue;
                     }
-                    if let FocusTarget::Options(index) = focus {
-                        match key.code {
-                            KeyCode::Char(' ')
-                                if matches!(
-                                    key.kind,
-                                    event::KeyEventKind::Press | event::KeyEventKind::Repeat
-                                ) =>
-                            {
-                                if let Some(option) = launch_options.get_mut(index) {
-                                    option.enabled = !option.enabled;
+                    if focus == FocusTarget::FlowSelect {
+                        if matches!(
+                            key.kind,
+                            event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                        ) {
+                            let loaded = matches!(flow_state.catalog, CatalogState::Loaded(_));
+                            let intent = match key.code {
+                                KeyCode::Char(' ') | KeyCode::Right | KeyCode::Down => {
+                                    Some(PendingFlowIntent::Cycle(1))
                                 }
+                                KeyCode::Left | KeyCode::Up => Some(PendingFlowIntent::Cycle(-1)),
+                                KeyCode::Enter => Some(PendingFlowIntent::OpenPicker),
+                                _ => None,
+                            };
+                            match intent {
+                                Some(PendingFlowIntent::Cycle(step)) if loaded => {
+                                    flow_state.cycle(step);
+                                    if flow_state.pending_explain {
+                                        composer.set_notice("loading flow inputs…");
+                                    }
+                                }
+                                Some(PendingFlowIntent::OpenPicker) if loaded => {
+                                    skill_popup = None;
+                                    file_popup = None;
+                                    slash_popup = None;
+                                    flow_popup = Some(FlowPopup::new(
+                                        flow_state.selected,
+                                        flow_state.flows(),
+                                    ));
+                                }
+                                Some(intent) => {
+                                    // Paint a loading frame, then fetch on the
+                                    // next loop pass and apply the intent.
+                                    skill_popup = None;
+                                    file_popup = None;
+                                    slash_popup = None;
+                                    composer.set_notice("loading flows…");
+                                    pending_flow_intent = Some(intent);
+                                }
+                                None => {}
                             }
-                            KeyCode::Enter
-                                if matches!(
-                                    key.kind,
-                                    event::KeyEventKind::Press | event::KeyEventKind::Repeat
-                                ) =>
-                            {
-                                focus = focus.next(launch_options.len(), !targets.is_empty());
+                        }
+                        log_key_debug(
+                            &mut key_debug,
+                            focus,
+                            key,
+                            "flow_select",
+                            "handled",
+                            lines_before,
+                            composer_line_count(&composer),
+                        );
+                        continue;
+                    }
+                    if let FocusTarget::Options(index) = focus {
+                        if matches!(
+                            key.kind,
+                            event::KeyEventKind::Press | event::KeyEventKind::Repeat
+                        ) {
+                            let count = launch_options.len();
+                            match key.code {
+                                KeyCode::Char(' ') => {
+                                    if let Some(option) = launch_options.get_mut(index) {
+                                        option.enabled = !option.enabled;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    focus = focus.next(FocusContext {
+                                        flow_field_count: flow_state.form_field_count(),
+                                        has_target_select: !targets.is_empty(),
+                                        has_flow_select: flow_state.available
+                                            && !targets.is_empty(),
+                                        option_count: count,
+                                    });
+                                }
+                                KeyCode::Right | KeyCode::Down if count > 0 => {
+                                    focus = FocusTarget::Options((index + 1) % count);
+                                }
+                                KeyCode::Left | KeyCode::Up if count > 0 => {
+                                    focus = FocusTarget::Options((index + count - 1) % count);
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                         log_key_debug(
                             &mut key_debug,
@@ -577,27 +793,29 @@ fn run_inner(
                         );
                         continue;
                     }
-                    if key.code == KeyCode::Char('$')
-                        && matches!(
-                            key.kind,
-                            event::KeyEventKind::Press | event::KeyEventKind::Repeat
-                        )
-                        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
-                        && !skills.is_empty()
-                        && file_popup.is_none()
-                        && slash_popup.is_none()
-                    {
-                        skill_popup = Some(SkillPopup::default());
-                        log_key_debug(
-                            &mut key_debug,
-                            focus,
-                            key,
-                            "app",
-                            "open_skill_popup",
-                            lines_before,
-                            composer_line_count(&composer),
-                        );
-                        continue;
+                    if is_plain_enter_press(key) && focus == FocusTarget::Prompt {
+                        if let Some(blocker) =
+                            flow_submit_blocker(&flow_state, targets.get(target_index))
+                        {
+                            match composer.plain_enter_gate() {
+                                PlainEnterOutcome::InsertedNewline
+                                | PlainEnterOutcome::EmptyDraft => {}
+                                PlainEnterOutcome::WouldSubmit => {
+                                    composer.set_notice(blocker.message);
+                                    focus = clamp_flow_focus(blocker.focus, &flow_state);
+                                }
+                            }
+                            log_key_debug(
+                                &mut key_debug,
+                                focus,
+                                key,
+                                "flow_gate",
+                                "blocked",
+                                lines_before,
+                                composer_line_count(&composer),
+                            );
+                            continue;
+                        }
                     }
                     if skill_popup.is_none() && file_popup.is_none() && slash_popup.is_none() {
                         if let Some(text) = handle_history_key(&mut history, &composer, key) {
@@ -636,6 +854,15 @@ fn run_inner(
                                 thread_name,
                                 toggled_argv: enabled_option_argv(&launch_options),
                                 target: targets.get(target_index).cloned(),
+                                flow: flow_state.selected_flow().map(|entry| SubmittedFlow {
+                                    path: entry.path.clone(),
+                                    name: entry.name.clone(),
+                                    values: flow_state
+                                        .form
+                                        .as_ref()
+                                        .map(FlowForm::values)
+                                        .unwrap_or_default(),
+                                }),
                             })));
                         }
                         ComposerAction::None => {
@@ -650,6 +877,7 @@ fn run_inner(
                             );
                         }
                     }
+                    sync_skill_popup(&mut skill_popup, &composer, &skills);
                     sync_file_popup(
                         &mut file_popup,
                         &composer,
@@ -659,7 +887,7 @@ fn run_inner(
                     sync_slash_popup(&mut slash_popup, &composer);
                 }
                 Event::Paste(text) => {
-                    if target_popup.is_some() {
+                    if target_popup.is_some() || flow_popup.is_some() {
                         continue;
                     }
                     let lines_before = composer_line_count(&composer);
@@ -670,6 +898,7 @@ fn run_inner(
                         FocusTarget::Name => name_input.handle_paste(&text),
                         FocusTarget::Prompt => {
                             composer.handle_paste(text);
+                            sync_skill_popup(&mut skill_popup, &composer, &skills);
                             sync_file_popup(
                                 &mut file_popup,
                                 &composer,
@@ -678,7 +907,14 @@ fn run_inner(
                             );
                             sync_slash_popup(&mut slash_popup, &composer);
                         }
-                        FocusTarget::TargetSelect | FocusTarget::Options(_) => {}
+                        FocusTarget::FlowInput(index) => {
+                            if let Some(form) = flow_state.form.as_mut() {
+                                form.handle_paste(index, &text);
+                            }
+                        }
+                        FocusTarget::TargetSelect
+                        | FocusTarget::FlowSelect
+                        | FocusTarget::Options(_) => {}
                     }
                     log_event_debug(
                         &mut key_debug,
@@ -852,13 +1088,20 @@ fn handle_history_key(
 
     match key.code {
         KeyCode::Up
-            if key.modifiers.is_empty() && (composer.is_empty() || history.is_browsing()) =>
+            if key.modifiers.is_empty()
+                && (composer.is_empty()
+                    || (history.is_browsing() && composer.is_on_first_visual_line())) =>
         {
             history.navigate_up(&composer.text())
         }
-        KeyCode::Down if key.modifiers.is_empty() && history.is_browsing() => {
+        KeyCode::Down
+            if key.modifiers.is_empty()
+                && history.is_browsing()
+                && composer.is_on_last_visual_line() =>
+        {
             history.navigate_down()
         }
+        KeyCode::Up | KeyCode::Down if key.modifiers.is_empty() => None,
         _ => {
             history.stop_browsing();
             None
@@ -874,6 +1117,71 @@ enum FileKeyOutcome {
 enum SlashKeyOutcome {
     Handled,
     Forward,
+}
+
+enum SkillKeyOutcome {
+    Handled,
+    Forward,
+}
+
+fn handle_skill_popup_key(
+    skill_popup: &mut Option<SkillPopup>,
+    composer: &mut ComposerInput,
+    skills: &[Skill],
+    key: KeyEvent,
+) -> SkillKeyOutcome {
+    let token = composer.current_skill_token(true);
+    let token_query = token.as_ref().map(|token| token.query.as_str());
+    let Some(popup) = skill_popup.as_mut() else {
+        return SkillKeyOutcome::Forward;
+    };
+
+    match popup.handle_key(key, skills, token_query) {
+        SkillPopupAction::None => SkillKeyOutcome::Handled,
+        SkillPopupAction::Cancel | SkillPopupAction::Close => {
+            *skill_popup = None;
+            SkillKeyOutcome::Handled
+        }
+        SkillPopupAction::Accept(mention) => {
+            if let Some(token) = token {
+                composer.replace_char_range(token.start, token.end, &format!("{mention} "));
+            }
+            *skill_popup = None;
+            SkillKeyOutcome::Handled
+        }
+        SkillPopupAction::Forward => SkillKeyOutcome::Forward,
+    }
+}
+
+fn sync_skill_popup(
+    skill_popup: &mut Option<SkillPopup>,
+    composer: &ComposerInput,
+    skills: &[Skill],
+) {
+    let Some(token) = composer.current_skill_token(true) else {
+        if let Some(popup) = skill_popup.as_mut() {
+            popup.clear_dismissed_token();
+        }
+        *skill_popup = None;
+        return;
+    };
+
+    // `$` shows up in ordinary prose (prices, shell vars) far more often than
+    // `@` or `/`, so only surface the popup while something actually matches.
+    if crate::skill_popup::matching_indices(&token.query, skills).is_empty() {
+        *skill_popup = None;
+        return;
+    }
+
+    match skill_popup {
+        Some(popup) if popup.dismissed_token() == Some(token.query.as_str()) => {}
+        Some(popup) => popup.set_query(&token.query, skills),
+        None => {
+            let mut popup = SkillPopup::default();
+            popup.set_query(&token.query, skills);
+            *skill_popup = Some(popup);
+        }
+    }
 }
 
 fn handle_file_popup_key(
@@ -1030,6 +1338,19 @@ fn is_tab_press(key: KeyEvent) -> bool {
     ) && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
 }
 
+fn is_back_tab_press(key: KeyEvent) -> bool {
+    is_tab_press(key)
+        && (key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn is_esc_press(key: KeyEvent) -> bool {
+    matches!(
+        key.kind,
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat
+    ) && key.code == KeyCode::Esc
+        && key.modifiers.is_empty()
+}
+
 fn is_plain_enter_press(key: KeyEvent) -> bool {
     matches!(
         key.kind,
@@ -1179,6 +1500,60 @@ fn composer_line_count(composer: &ComposerInput) -> usize {
     composer.text().split('\n').count().max(1)
 }
 
+fn hint_items_for(focus: FocusTarget) -> Vec<(&'static str, &'static str)> {
+    match focus {
+        FocusTarget::Name => vec![
+            ("Tab", "field"),
+            ("Shift+Tab", "back"),
+            ("Enter", "prompt"),
+            ("Esc", "prompt"),
+            ("Ctrl+C", "quit"),
+        ],
+        FocusTarget::Prompt => vec![
+            ("Tab", "field"),
+            ("Enter", "send"),
+            ("Shift+Enter", "newline"),
+            ("↑", "history"),
+            ("Ctrl+R", "search"),
+            ("Ctrl+G", "editor"),
+            ("Ctrl+C", "quit"),
+            // Last on purpose: at narrow widths the hint row clips from the
+            // tail, and the seven hints above are the load-bearing ones.
+            ("Esc", "clear"),
+        ],
+        FocusTarget::FlowInput(_) => vec![
+            ("Tab", "field"),
+            ("Enter", "next"),
+            ("Space", "toggle"),
+            ("Esc", "prompt"),
+            ("Ctrl+C", "quit"),
+        ],
+        FocusTarget::TargetSelect => vec![
+            ("Tab", "field"),
+            ("←/→", "target"),
+            ("Enter", "targets"),
+            ("Ctrl+G", "edit"),
+            ("Esc", "prompt"),
+            ("Ctrl+C", "quit"),
+        ],
+        FocusTarget::FlowSelect => vec![
+            ("Tab", "field"),
+            ("←/→", "flow"),
+            ("Enter", "flows"),
+            ("Esc", "prompt"),
+            ("Ctrl+C", "quit"),
+        ],
+        FocusTarget::Options(_) => vec![
+            ("Tab", "field"),
+            ("←/→", "option"),
+            ("Space", "toggle"),
+            ("Enter", "next"),
+            ("Esc", "prompt"),
+            ("Ctrl+C", "quit"),
+        ],
+    }
+}
+
 fn composer_action_label(lines_before: usize, lines_after: usize) -> &'static str {
     if lines_after > lines_before {
         "insert_newline"
@@ -1188,7 +1563,7 @@ fn composer_action_label(lines_before: usize, lines_after: usize) -> &'static st
 }
 
 fn handle_ctrl_c(
-    name_input: &mut NameInput,
+    name_input: &mut LineInput,
     composer: &mut ComposerInput,
     focus: FocusTarget,
 ) -> bool {
@@ -1240,23 +1615,317 @@ fn cwd_name_prefix(cwd: &str) -> String {
 enum FocusTarget {
     Name,
     Prompt,
+    /// One field of the mdflow flow-input form.
+    FlowInput(usize),
     TargetSelect,
+    FlowSelect,
     Options(usize),
 }
 
+/// Which focusable widgets exist right now; drives Tab order:
+/// Name → Prompt → FlowInput(0..n) → TargetSelect → FlowSelect → Options(0..k).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FocusContext {
+    flow_field_count: usize,
+    has_target_select: bool,
+    has_flow_select: bool,
+    option_count: usize,
+}
+
 impl FocusTarget {
-    fn next(self, option_count: usize, has_target_select: bool) -> Self {
+    fn next(self, ctx: FocusContext) -> Self {
         match self {
             Self::Name => Self::Prompt,
-            Self::Prompt if has_target_select => Self::TargetSelect,
-            Self::Prompt if option_count == 0 => Self::Name,
-            Self::Prompt => Self::Options(0),
-            Self::TargetSelect if option_count == 0 => Self::Name,
-            Self::TargetSelect => Self::Options(0),
-            Self::Options(index) if index + 1 < option_count => Self::Options(index + 1),
+            Self::Prompt if ctx.flow_field_count > 0 => Self::FlowInput(0),
+            Self::Prompt => Self::after_flow_inputs(ctx),
+            Self::FlowInput(index) if index + 1 < ctx.flow_field_count => {
+                Self::FlowInput(index + 1)
+            }
+            Self::FlowInput(_) => Self::after_flow_inputs(ctx),
+            Self::TargetSelect if ctx.has_flow_select => Self::FlowSelect,
+            Self::TargetSelect => Self::after_flow_select(ctx),
+            Self::FlowSelect => Self::after_flow_select(ctx),
+            Self::Options(index) if index + 1 < ctx.option_count => Self::Options(index + 1),
             Self::Options(_) => Self::Name,
         }
     }
+
+    fn prev(self, ctx: FocusContext) -> Self {
+        match self {
+            Self::Name if ctx.option_count > 0 => Self::Options(ctx.option_count - 1),
+            Self::Name if ctx.has_flow_select => Self::FlowSelect,
+            Self::Name if ctx.has_target_select => Self::TargetSelect,
+            Self::Name if ctx.flow_field_count > 0 => Self::FlowInput(ctx.flow_field_count - 1),
+            Self::Name => Self::Prompt,
+            Self::Prompt => Self::Name,
+            Self::FlowInput(0) => Self::Prompt,
+            Self::FlowInput(index) => Self::FlowInput(index - 1),
+            Self::TargetSelect if ctx.flow_field_count > 0 => {
+                Self::FlowInput(ctx.flow_field_count - 1)
+            }
+            Self::TargetSelect => Self::Prompt,
+            Self::FlowSelect if ctx.has_target_select => Self::TargetSelect,
+            Self::FlowSelect if ctx.flow_field_count > 0 => {
+                Self::FlowInput(ctx.flow_field_count - 1)
+            }
+            Self::FlowSelect => Self::Prompt,
+            Self::Options(0) if ctx.has_flow_select => Self::FlowSelect,
+            Self::Options(0) if ctx.has_target_select => Self::TargetSelect,
+            Self::Options(0) if ctx.flow_field_count > 0 => {
+                Self::FlowInput(ctx.flow_field_count - 1)
+            }
+            Self::Options(0) => Self::Prompt,
+            Self::Options(index) => Self::Options(index - 1),
+        }
+    }
+
+    fn after_flow_inputs(ctx: FocusContext) -> Self {
+        if ctx.has_target_select {
+            Self::TargetSelect
+        } else if ctx.has_flow_select {
+            Self::FlowSelect
+        } else if ctx.option_count > 0 {
+            Self::Options(0)
+        } else {
+            Self::Name
+        }
+    }
+
+    fn after_flow_select(ctx: FocusContext) -> Self {
+        if ctx.option_count > 0 {
+            Self::Options(0)
+        } else {
+            Self::Name
+        }
+    }
+}
+
+/// mdflow catalog state; fetched lazily on first Flow-slot interaction.
+enum CatalogState {
+    NotLoaded,
+    Loaded(Vec<FlowEntry>),
+    Failed(String),
+}
+
+/// Intent queued while the catalog loads, so the "loading flows…" frame
+/// paints before the blocking fetch runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingFlowIntent {
+    OpenPicker,
+    Cycle(isize),
+}
+
+struct FlowState {
+    catalog: CatalogState,
+    /// Index into the loaded catalog; None = "No flow" (launch target directly).
+    selected: Option<usize>,
+    available: bool,
+    mdflow_bin: String,
+    /// Input form for the selected flow; built from `mdflow explain --json`.
+    form: Option<FlowForm>,
+    /// Per-flow-path forms, preserving typed values across reselects.
+    form_cache: std::collections::HashMap<String, FlowForm>,
+    explain_error: Option<String>,
+    /// Explain queued until after the next draw, so a loading notice paints
+    /// first and rapid cycling coalesces into one fetch.
+    pending_explain: bool,
+}
+
+impl FlowState {
+    fn new(mdflow_bin: String, targets: &[Target]) -> Self {
+        let available = targets
+            .iter()
+            .any(|target| target.kind == TargetKind::Mdflow)
+            || bin_on_path(&mdflow_bin);
+        Self {
+            catalog: CatalogState::NotLoaded,
+            selected: None,
+            available,
+            mdflow_bin,
+            form: None,
+            form_cache: std::collections::HashMap::new(),
+            explain_error: None,
+            pending_explain: false,
+        }
+    }
+
+    fn flows(&self) -> &[FlowEntry] {
+        match &self.catalog {
+            CatalogState::Loaded(flows) => flows,
+            _ => &[],
+        }
+    }
+
+    fn selected_flow(&self) -> Option<&FlowEntry> {
+        self.selected.and_then(|index| self.flows().get(index))
+    }
+
+    fn slot_label(&self) -> String {
+        match (&self.catalog, self.selected_flow()) {
+            (CatalogState::Failed(_), _) => "unavailable".to_string(),
+            (_, Some(flow)) => flow.name.clone(),
+            (_, None) => "none".to_string(),
+        }
+    }
+
+    /// Fetches (or re-fetches) the catalog, preserving the selection by path.
+    fn load_catalog(&mut self, cwd: &Path) -> Result<(), String> {
+        let previous_path = self.selected_flow().map(|flow| flow.path.clone());
+        match crate::flow::fetch_catalog(&self.mdflow_bin, cwd) {
+            Ok(catalog) => {
+                let selected = previous_path
+                    .and_then(|path| catalog.flows.iter().position(|flow| flow.path == path));
+                self.catalog = CatalogState::Loaded(catalog.flows);
+                self.select(selected);
+                Ok(())
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.catalog = CatalogState::Failed(message.clone());
+                self.select(None);
+                Err(message)
+            }
+        }
+    }
+
+    fn cycle(&mut self, step: isize) {
+        let count = self.flows().len();
+        if count == 0 {
+            self.select(None);
+            return;
+        }
+        // Positions: 0 = "No flow", 1..=count = flows.
+        let current = self.selected.map(|index| index + 1).unwrap_or(0) as isize;
+        let next = (current + step).rem_euclid(count as isize + 1) as usize;
+        self.select(next.checked_sub(1));
+    }
+
+    /// Changes the selection, stashing the current form (typed values and
+    /// all) and restoring a cached one or queueing an explain fetch.
+    fn select(&mut self, row: Option<usize>) {
+        self.stash_form();
+        self.selected = row;
+        self.explain_error = None;
+        self.pending_explain = false;
+        self.form = None;
+        if let Some(path) = self.selected_flow().map(|flow| flow.path.clone()) {
+            match self.form_cache.remove(&path) {
+                Some(form) => self.form = Some(form),
+                None => self.pending_explain = true,
+            }
+        }
+    }
+
+    fn stash_form(&mut self) {
+        if let (Some(form), Some(flow)) = (
+            self.form.take(),
+            self.selected.and_then(|index| match &self.catalog {
+                CatalogState::Loaded(flows) => flows.get(index),
+                _ => None,
+            }),
+        ) {
+            self.form_cache.insert(flow.path.clone(), form);
+        }
+    }
+
+    /// Runs the queued explain fetch. Returns an error message for a notice.
+    fn run_pending_explain(&mut self, cwd: &Path) -> Result<(), String> {
+        self.pending_explain = false;
+        let Some(flow) = self.selected_flow() else {
+            return Ok(());
+        };
+        let path = flow.path.clone();
+        match crate::flow::explain_flow(&self.mdflow_bin, &path, cwd) {
+            Ok(explain) => {
+                let (fields, prompt_capable) = crate::flow::extract_fields(&explain);
+                self.form = Some(FlowForm::new(fields, prompt_capable));
+                self.explain_error = None;
+                Ok(())
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.explain_error = Some(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    fn form_field_count(&self) -> usize {
+        self.form.as_ref().map_or(0, FlowForm::field_count)
+    }
+
+    fn catalog_error(&self) -> Option<&str> {
+        match &self.catalog {
+            CatalogState::Failed(message) => Some(message.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Reason a submit cannot proceed; jump focus to the offending widget.
+struct FlowSubmitBlocker {
+    message: String,
+    focus: FocusTarget,
+}
+
+fn flow_submit_blocker(
+    flow_state: &FlowState,
+    target: Option<&Target>,
+) -> Option<FlowSubmitBlocker> {
+    if let Some(form) = &flow_state.form {
+        if let Some((index, message)) = form.first_invalid() {
+            return Some(FlowSubmitBlocker {
+                message,
+                focus: FocusTarget::FlowInput(index),
+            });
+        }
+    }
+    if flow_state.selected_flow().is_some() {
+        if let Some(error) = &flow_state.explain_error {
+            return Some(FlowSubmitBlocker {
+                message: format!("flow inputs unavailable: {error}"),
+                focus: FocusTarget::FlowSelect,
+            });
+        }
+        return None;
+    }
+    // No flow selected: an mdflow target needs one (unless it pins its own).
+    if let Some(target) = target {
+        if target.kind == TargetKind::Mdflow && target.flow.is_none() {
+            let message = match flow_state.catalog_error() {
+                Some(error) => format!("mdflow target needs a flow (flows: {error})"),
+                None => "mdflow target needs a flow: Tab to the Flow slot".to_string(),
+            };
+            return Some(FlowSubmitBlocker {
+                message,
+                focus: FocusTarget::FlowSelect,
+            });
+        }
+    }
+    None
+}
+
+/// Stale FlowInput focus (form rebuilt/cleared) falls back to the prompt.
+fn clamp_flow_focus(focus: FocusTarget, flow_state: &FlowState) -> FocusTarget {
+    match focus {
+        FocusTarget::FlowInput(index) if index >= flow_state.form_field_count() => {
+            if flow_state.form_field_count() > 0 {
+                FocusTarget::FlowInput(flow_state.form_field_count() - 1)
+            } else {
+                FocusTarget::Prompt
+            }
+        }
+        other => other,
+    }
+}
+
+fn bin_on_path(bin: &str) -> bool {
+    if bin.contains('/') {
+        return Path::new(bin).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
 }
 
 fn next_target_index(current: usize, count: usize, step: isize) -> usize {
@@ -1381,182 +2050,8 @@ fn initial_focus() -> FocusTarget {
     FocusTarget::Name
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct NameInput {
-    text: String,
-    cursor: usize,
-}
-
-impl NameInput {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn set_text(&mut self, text: &str) {
-        self.text = single_line_text(text);
-        self.cursor = self.text.chars().count();
-    }
-
-    fn text(&self) -> &str {
-        &self.text
-    }
-
-    fn is_empty(&self) -> bool {
-        self.text.trim().is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-    }
-
-    fn input(&mut self, key: KeyEvent) {
-        if !matches!(
-            key.kind,
-            event::KeyEventKind::Press | event::KeyEventKind::Repeat
-        ) {
-            return;
-        }
-
-        match key.code {
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.insert_char(c)
-            }
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left => self.move_left(),
-            KeyCode::Right => self.move_right(),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.char_len(),
-            _ => {}
-        }
-    }
-
-    fn handle_paste(&mut self, text: &str) {
-        let normalized = single_line_text(text);
-        for c in normalized.chars() {
-            self.insert_char(c);
-        }
-    }
-
-    fn render_ref(&self, area: Rect, focused: bool, theme: &Theme, buf: &mut Buffer) {
-        let title = if focused { "Name *" } else { "Name" };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .style(theme.panel_style())
-            .border_style(theme.border_style(focused))
-            .title_style(theme.title_style(focused));
-        let inner = block.inner(area);
-        block.render(area, buf);
-        if inner.width == 0 || inner.height == 0 {
-            return;
-        }
-
-        clear_area(inner, theme.panel_style(), buf);
-        let content_width = inner.width as usize;
-        if self.text.is_empty() {
-            buf.set_stringn(
-                inner.x,
-                inner.y,
-                "Optional conversation name",
-                content_width,
-                theme.muted_style(),
-            );
-            return;
-        }
-
-        let cursor = self.cursor.min(self.char_len());
-        let first_visible = cursor.saturating_sub(content_width.saturating_sub(1));
-        let visible = self
-            .text
-            .chars()
-            .skip(first_visible)
-            .take(content_width)
-            .collect::<String>();
-        buf.set_stringn(inner.x, inner.y, visible, content_width, theme.text_style());
-    }
-
-    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if area.width < 3 || area.height < 3 {
-            return None;
-        }
-        let inner = Block::default().borders(Borders::ALL).inner(area);
-        if inner.width == 0 || inner.height == 0 {
-            return None;
-        }
-        let content_width = inner.width as usize;
-        let cursor = self.cursor.min(self.char_len());
-        let first_visible = cursor.saturating_sub(content_width.saturating_sub(1));
-        let visible_col = cursor.saturating_sub(first_visible) as u16;
-        Some((
-            inner.x + visible_col.min(inner.width.saturating_sub(1)),
-            inner.y,
-        ))
-    }
-
-    fn insert_char(&mut self, c: char) {
-        let byte_index = byte_index_for_char(&self.text, self.cursor);
-        self.text.insert(byte_index, c);
-        self.cursor += 1;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let start = byte_index_for_char(&self.text, self.cursor - 1);
-        let end = byte_index_for_char(&self.text, self.cursor);
-        self.text.replace_range(start..end, "");
-        self.cursor -= 1;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor >= self.char_len() {
-            return;
-        }
-        let start = byte_index_for_char(&self.text, self.cursor);
-        let end = byte_index_for_char(&self.text, self.cursor + 1);
-        self.text.replace_range(start..end, "");
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_len());
-    }
-
-    fn char_len(&self) -> usize {
-        self.text.chars().count()
-    }
-}
-
-fn byte_index_for_char(value: &str, char_index: usize) -> usize {
-    value
-        .char_indices()
-        .nth(char_index)
-        .map(|(index, _)| index)
-        .unwrap_or(value.len())
-}
-
-fn single_line_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn clear_area(area: Rect, style: Style, buf: &mut Buffer) {
-    let blank = " ".repeat(area.width as usize);
-    for y in area.y..area.bottom() {
-        buf.set_string(area.x, y, &blank, style);
-    }
-}
-
 struct DrawState<'a> {
-    name_input: &'a NameInput,
+    name_input: &'a LineInput,
     composer: &'a ComposerInput,
     focus: FocusTarget,
     skills: &'a [Skill],
@@ -1568,6 +2063,8 @@ struct DrawState<'a> {
     targets: &'a [Target],
     target_index: usize,
     target_popup: Option<&'a TargetPopup>,
+    flow_state: &'a FlowState,
+    flow_popup: Option<&'a FlowPopup>,
     theme: &'a Theme,
     skill_mentions: &'a [String],
 }
@@ -1586,6 +2083,8 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
         targets,
         target_index,
         target_popup,
+        flow_state,
+        flow_popup,
         theme,
         skill_mentions,
     } = state;
@@ -1612,7 +2111,8 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
     } else {
         1
     };
-    let fixed_input_height = 3 + options_height;
+    let form_height = flow_state.form.as_ref().map_or(0, FlowForm::height);
+    let fixed_input_height = 3 + options_height + form_height;
     let composer_height = composer.desired_height(layout[1].width).clamp(
         3,
         layout[1].height.saturating_sub(fixed_input_height).max(3),
@@ -1623,6 +2123,7 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
             Constraint::Min(0),
             Constraint::Length(3),
             Constraint::Length(composer_height),
+            Constraint::Length(form_height),
             Constraint::Length(options_height),
         ])
         .split(layout[1]);
@@ -1652,6 +2153,14 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
         let popup_area = slash_popup_area(input_rows[2], popup);
         popup.render(popup_area, frame.buffer_mut(), theme);
     }
+    if let Some(form) = &flow_state.form {
+        let focused_field = match focus {
+            FocusTarget::FlowInput(index) => Some(index),
+            _ => None,
+        };
+        form.render(input_rows[3], focused_field, theme, frame.buffer_mut());
+    }
+    let flow_slot_label = flow_state.slot_label();
     if options_height > 0 {
         let target_select = if has_target_select {
             targets
@@ -1660,9 +2169,19 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
         } else {
             None
         };
+        let flow_ignores_prompt = flow_state
+            .form
+            .as_ref()
+            .is_some_and(|form| !form.prompt_capable);
+        let flow_select = (flow_state.available && has_target_select).then(|| FlowSlotView {
+            label: flow_slot_label.as_str(),
+            focused: focus == FocusTarget::FlowSelect,
+            ignores_prompt: flow_ignores_prompt,
+        });
         render_launch_options(
-            input_rows[3],
+            input_rows[4],
             target_select,
+            flow_select,
             launch_options,
             focused_option_index(focus),
             theme,
@@ -1673,13 +2192,27 @@ fn draw(frame: &mut Frame<'_>, state: DrawState<'_>) {
         let popup_area = target_popup_area(area, popup, targets);
         popup.render(popup_area, frame.buffer_mut(), targets, target_index, theme);
     }
-    let cursor = if target_popup.is_some() {
+    if let Some(popup) = flow_popup {
+        let popup_area = flow_popup_area(area, popup, flow_state.flows());
+        popup.render(
+            popup_area,
+            frame.buffer_mut(),
+            flow_state.flows(),
+            flow_state.selected,
+            theme,
+        );
+    }
+    let cursor = if target_popup.is_some() || flow_popup.is_some() {
         None
     } else {
         match focus {
             FocusTarget::Name => name_input.cursor_pos(input_rows[1]),
             FocusTarget::Prompt => composer.cursor_pos(input_rows[2]),
-            FocusTarget::TargetSelect | FocusTarget::Options(_) => None,
+            FocusTarget::FlowInput(index) => flow_state
+                .form
+                .as_ref()
+                .and_then(|form| form.cursor_pos(input_rows[3], index)),
+            FocusTarget::TargetSelect | FocusTarget::FlowSelect | FocusTarget::Options(_) => None,
         }
     };
     if let Some((x, y)) = cursor {
@@ -1694,16 +2227,27 @@ fn focused_option_index(focus: FocusTarget) -> Option<usize> {
     }
 }
 
+struct FlowSlotView<'a> {
+    label: &'a str,
+    focused: bool,
+    /// True when the selected flow never references the composed prompt.
+    ignores_prompt: bool,
+}
+
 fn render_launch_options(
     area: Rect,
     target_select: Option<(&str, bool)>,
+    flow_select: Option<FlowSlotView<'_>>,
     options: &[ToggleOption],
     focused_index: Option<usize>,
     theme: &Theme,
     buf: &mut Buffer,
 ) {
     clear_area(area, theme.panel_style(), buf);
-    if area.width == 0 || area.height == 0 || (options.is_empty() && target_select.is_none()) {
+    if area.width == 0
+        || area.height == 0
+        || (options.is_empty() && target_select.is_none() && flow_select.is_none())
+    {
         return;
     }
 
@@ -1716,6 +2260,24 @@ fn render_launch_options(
             spans.push(Span::styled(" Enter manage", theme.muted_style()));
         } else {
             spans.push(Span::styled(label, theme.text_style()));
+        }
+        if flow_select.is_some() || !options.is_empty() {
+            spans.push("  ".into());
+        }
+    }
+    if let Some(flow) = flow_select {
+        spans.push(Span::styled("Flow ", theme.muted_style()));
+        let label = format!("‹{}›", flow.label);
+        if flow.focused {
+            spans.push(Span::styled(label, theme.selected_style()));
+            spans.push(Span::styled(" Enter flows", theme.muted_style()));
+        } else if flow.label == "none" || flow.label == "unavailable" {
+            spans.push(Span::styled(label, theme.muted_style()));
+        } else {
+            spans.push(Span::styled(label, theme.text_style()));
+        }
+        if flow.ignores_prompt {
+            spans.push(Span::styled(" ⚠ ignores prompt", theme.warning_style()));
         }
         if !options.is_empty() {
             spans.push("  ".into());
@@ -1741,13 +2303,6 @@ fn render_launch_options(
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
 }
 
-fn insert_text(composer: &mut ComposerInput, text: &str) {
-    for c in text.chars() {
-        let key = KeyEvent::from(KeyCode::Char(c));
-        let _ = composer.input(key);
-    }
-}
-
 fn popup_area(composer_area: Rect, popup: &SkillPopup, skills: &[Skill]) -> Rect {
     let width = composer_area.width.saturating_sub(2).clamp(20, 64);
     let height = popup
@@ -1768,6 +2323,18 @@ fn target_popup_area(frame_area: Rect, popup: &TargetPopup, targets: &[Target]) 
         .clamp(24, 72)
         .min(frame_area.width);
     let height = popup.required_height(targets).max(4).min(frame_area.height);
+    let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
+    let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn flow_popup_area(frame_area: Rect, popup: &FlowPopup, flows: &[FlowEntry]) -> Rect {
+    let width = frame_area
+        .width
+        .saturating_sub(4)
+        .clamp(24, 80)
+        .min(frame_area.width);
+    let height = popup.required_height(flows).max(5).min(frame_area.height);
     let x = frame_area.x + frame_area.width.saturating_sub(width) / 2;
     let y = frame_area.y + frame_area.height.saturating_sub(height) / 2;
     Rect::new(x, y, width, height)
@@ -2117,8 +2684,87 @@ mod tests {
     }
 
     #[test]
+    fn esc_press_requires_plain_escape() {
+        assert!(is_esc_press(KeyEvent::from(KeyCode::Esc)));
+        assert!(!is_esc_press(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::ALT
+        )));
+        assert!(!is_esc_press(KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            event::KeyEventKind::Release
+        )));
+    }
+
+    #[test]
+    fn deleting_into_skill_mention_reopens_search() {
+        let skills = vec![Skill {
+            name: "fusion".to_string(),
+            description: "Run Fusion".to_string(),
+            path: PathBuf::from("/tmp/fusion/SKILL.md"),
+        }];
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("$fusion ");
+        let mut popup: Option<SkillPopup> = None;
+
+        // Cursor sits after the trailing space: no active token.
+        sync_skill_popup(&mut popup, &composer, &skills);
+        assert!(popup.is_none());
+
+        // Backspacing over the space and into the mention re-triggers search.
+        composer.input(KeyEvent::from(KeyCode::Backspace));
+        composer.input(KeyEvent::from(KeyCode::Backspace));
+        sync_skill_popup(&mut popup, &composer, &skills);
+        assert!(popup.is_some());
+
+        // Accepting replaces the partial token with the full mention.
+        assert!(matches!(
+            handle_skill_popup_key(
+                &mut popup,
+                &mut composer,
+                &skills,
+                KeyEvent::from(KeyCode::Enter)
+            ),
+            SkillKeyOutcome::Handled
+        ));
+        assert_eq!(composer.text(), "$fusion ");
+        assert!(popup.is_none());
+    }
+
+    #[test]
+    fn skill_popup_does_not_open_inside_plain_dollar_text() {
+        let skills = vec![Skill {
+            name: "fusion".to_string(),
+            description: "Run Fusion".to_string(),
+            path: PathBuf::from("/tmp/fusion/SKILL.md"),
+        }];
+        let mut composer = ComposerInput::new();
+        composer.set_initial_text("$99");
+        let mut popup: Option<SkillPopup> = None;
+
+        sync_skill_popup(&mut popup, &composer, &skills);
+        assert!(popup.is_none());
+    }
+
+    #[test]
+    fn typing_dollar_opens_skill_search() {
+        let skills = vec![Skill {
+            name: "fusion".to_string(),
+            description: "Run Fusion".to_string(),
+            path: PathBuf::from("/tmp/fusion/SKILL.md"),
+        }];
+        let mut composer = ComposerInput::new();
+        composer.input(KeyEvent::from(KeyCode::Char('$')));
+        let mut popup: Option<SkillPopup> = None;
+
+        sync_skill_popup(&mut popup, &composer, &skills);
+        assert!(popup.is_some());
+    }
+
+    #[test]
     fn ctrl_c_clears_nonempty_composer_before_canceling() {
-        let mut name_input = NameInput::new();
+        let mut name_input = LineInput::new("Name", "Optional conversation name");
         let mut composer = ComposerInput::new();
         composer.set_initial_text("draft");
 
@@ -2137,7 +2783,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_clears_nonempty_name_before_canceling() {
-        let mut name_input = NameInput::new();
+        let mut name_input = LineInput::new("Name", "Optional conversation name");
         let mut composer = ComposerInput::new();
         name_input.set_text("draft name");
 
@@ -2267,6 +2913,42 @@ mod tests {
     }
 
     #[test]
+    fn history_arrows_traverse_recalled_multiline_text_before_switching_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "prompt-builder-app-multiline-history-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("history.jsonl");
+        std::fs::write(
+            &path,
+            "{\"ts\":1,\"text\":\"older\"}\n{\"ts\":2,\"text\":\"first\\nsecond\"}\n",
+        )
+        .expect("write history");
+        let mut history = History::new(None, vec![path]);
+        let mut composer = ComposerInput::new();
+        composer.desired_height(82);
+
+        let recalled = handle_history_key(&mut history, &composer, KeyEvent::from(KeyCode::Up))
+            .expect("recall newest entry");
+        composer.set_text_end(&recalled);
+
+        assert_eq!(
+            handle_history_key(&mut history, &composer, KeyEvent::from(KeyCode::Up)),
+            None
+        );
+        composer.input(KeyEvent::from(KeyCode::Up));
+        assert!(composer.is_on_first_visual_line());
+        assert_eq!(
+            handle_history_key(&mut history, &composer, KeyEvent::from(KeyCode::Up)),
+            Some("older".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn reverse_search_recalls_matches_and_esc_restores_draft() {
         let dir =
             std::env::temp_dir().join(format!("prompt-builder-app-search-{}", std::process::id()));
@@ -2382,6 +3064,16 @@ mod tests {
     }
 
     #[test]
+    fn back_tab_press_is_reverse_focus_navigation() {
+        assert!(is_back_tab_press(KeyEvent::from(KeyCode::BackTab)));
+        assert!(is_back_tab_press(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_back_tab_press(KeyEvent::from(KeyCode::Tab)));
+    }
+
+    #[test]
     fn keyboard_enhancement_flags_match_codex_enter_contract() {
         let flags = keyboard_enhancement_flags();
 
@@ -2404,26 +3096,102 @@ mod tests {
         assert!(!tmux_session_detected(None, None));
     }
 
+    fn ctx(
+        flow_field_count: usize,
+        has_target_select: bool,
+        has_flow_select: bool,
+        option_count: usize,
+    ) -> FocusContext {
+        FocusContext {
+            flow_field_count,
+            has_target_select,
+            has_flow_select,
+            option_count,
+        }
+    }
+
     #[test]
     fn focus_cycles_through_options_when_present() {
-        assert_eq!(FocusTarget::Name.next(2, false), FocusTarget::Prompt);
-        assert_eq!(FocusTarget::Prompt.next(2, false), FocusTarget::Options(0));
+        let context = ctx(0, false, false, 2);
+        assert_eq!(FocusTarget::Name.next(context), FocusTarget::Prompt);
+        assert_eq!(FocusTarget::Prompt.next(context), FocusTarget::Options(0));
         assert_eq!(
-            FocusTarget::Options(0).next(2, false),
+            FocusTarget::Options(0).next(context),
             FocusTarget::Options(1)
         );
-        assert_eq!(FocusTarget::Options(1).next(2, false), FocusTarget::Name);
+        assert_eq!(FocusTarget::Options(1).next(context), FocusTarget::Name);
     }
 
     #[test]
     fn focus_cycles_through_target_selector_when_present() {
-        assert_eq!(FocusTarget::Prompt.next(0, true), FocusTarget::TargetSelect);
-        assert_eq!(FocusTarget::TargetSelect.next(0, true), FocusTarget::Name);
+        let context = ctx(0, true, false, 0);
+        assert_eq!(FocusTarget::Prompt.next(context), FocusTarget::TargetSelect);
+        assert_eq!(FocusTarget::TargetSelect.next(context), FocusTarget::Name);
         assert_eq!(
-            FocusTarget::TargetSelect.next(2, true),
+            FocusTarget::TargetSelect.next(ctx(0, true, false, 2)),
             FocusTarget::Options(0)
         );
-        assert_eq!(FocusTarget::Options(1).next(2, true), FocusTarget::Name);
+        assert_eq!(
+            FocusTarget::Options(1).next(ctx(0, true, false, 2)),
+            FocusTarget::Name
+        );
+    }
+
+    #[test]
+    fn focus_visits_flow_widgets_in_visual_order() {
+        let context = ctx(2, true, true, 1);
+        assert_eq!(FocusTarget::Prompt.next(context), FocusTarget::FlowInput(0));
+        assert_eq!(
+            FocusTarget::FlowInput(0).next(context),
+            FocusTarget::FlowInput(1)
+        );
+        assert_eq!(
+            FocusTarget::FlowInput(1).next(context),
+            FocusTarget::TargetSelect
+        );
+        assert_eq!(
+            FocusTarget::TargetSelect.next(context),
+            FocusTarget::FlowSelect
+        );
+        assert_eq!(
+            FocusTarget::FlowSelect.next(context),
+            FocusTarget::Options(0)
+        );
+        assert_eq!(FocusTarget::Options(0).next(context), FocusTarget::Name);
+    }
+
+    #[test]
+    fn focus_prev_reverses_forward_cycle() {
+        for flow_field_count in [0usize, 2] {
+            for has_target_select in [false, true] {
+                for has_flow_select in [false, true] {
+                    for option_count in [0usize, 2] {
+                        let context = ctx(
+                            flow_field_count,
+                            has_target_select,
+                            has_flow_select,
+                            option_count,
+                        );
+                        let mut targets = vec![FocusTarget::Name, FocusTarget::Prompt];
+                        targets.extend((0..flow_field_count).map(FocusTarget::FlowInput));
+                        if has_target_select {
+                            targets.push(FocusTarget::TargetSelect);
+                        }
+                        if has_flow_select {
+                            targets.push(FocusTarget::FlowSelect);
+                        }
+                        targets.extend((0..option_count).map(FocusTarget::Options));
+                        for focus in targets {
+                            assert_eq!(
+                                focus.next(context).prev(context),
+                                focus,
+                                "prev should undo next from {focus:?} ({context:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2439,6 +3207,7 @@ mod tests {
         render_launch_options(
             area,
             Some(("claude", true)),
+            None,
             &options,
             None,
             &Theme::catppuccin(),
@@ -2459,6 +3228,7 @@ mod tests {
         render_launch_options(
             area,
             Some(("egghead", false)),
+            None,
             &[],
             None,
             &Theme::catppuccin(),
@@ -2533,8 +3303,9 @@ mod tests {
 
     #[test]
     fn focus_cycle_skips_options_when_none_are_present() {
-        assert_eq!(FocusTarget::Name.next(0, false), FocusTarget::Prompt);
-        assert_eq!(FocusTarget::Prompt.next(0, false), FocusTarget::Name);
+        let context = ctx(0, false, false, 0);
+        assert_eq!(FocusTarget::Name.next(context), FocusTarget::Prompt);
+        assert_eq!(FocusTarget::Prompt.next(context), FocusTarget::Name);
     }
 
     #[test]
@@ -2578,15 +3349,6 @@ mod tests {
         assert!(matches!(outcome, FileKeyOutcome::Handled));
         assert!(popup.is_none());
         assert_eq!(composer.text(), "inspect src/main.rs ");
-    }
-
-    #[test]
-    fn name_input_is_single_line() {
-        let mut input = NameInput::new();
-
-        input.handle_paste("Fix\nthis\tthing");
-
-        assert_eq!(input.text(), "Fix this thing");
     }
 
     #[test]

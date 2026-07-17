@@ -4,10 +4,12 @@ use crate::cli::enabled_option_argv;
 use crate::cli::ClaudeLaunchConfig;
 use crate::cli::HandoffConfig;
 use crate::cli::LaunchConfig;
+use crate::cli::MdflowLaunchConfig;
 use crate::cli::PiLaunchConfig;
 use crate::cli::ToggleOption;
 use crate::codex_spawn;
 use crate::handoff;
+use crate::mdflow_spawn;
 use crate::pi_spawn;
 
 pub fn codex_launch_json(config: &LaunchConfig, prompt: &str, thread_name: Option<&str>) -> String {
@@ -40,6 +42,22 @@ pub fn pi_launch_json(config: &PiLaunchConfig, prompt: &str, session_name: Optio
         &config.env,
         None,
         Some(("pi", pi_json(config, session_name))),
+    )
+}
+
+pub fn mdflow_launch_json(
+    config: &MdflowLaunchConfig,
+    flow_path: &str,
+    values: &[(String, String)],
+    prompt: &str,
+) -> String {
+    render_manifest(
+        "mdflow",
+        &mdflow_spawn::mdflow_argv(config, flow_path, values, prompt),
+        prompt,
+        &config.env,
+        None,
+        Some(("mdflow", mdflow_json(config, flow_path, values))),
     )
 }
 
@@ -149,6 +167,29 @@ fn pi_json(config: &PiLaunchConfig, session_name: Option<&str>) -> String {
         .unwrap_or_else(|| "null".to_string());
     format!(
         "{{\"cwd\": {}, \"session_name\": {session_name}}}",
+        json_string(&config.cwd.to_string_lossy())
+    )
+}
+
+fn mdflow_json(
+    config: &MdflowLaunchConfig,
+    flow_path: &str,
+    values: &[(String, String)],
+) -> String {
+    let value_entries = values
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}: {}",
+                json_string(&format!("_{key}")),
+                json_string(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{\"flow\": {}, \"cwd\": {}, \"values\": {{{value_entries}}}}}",
+        json_string(flow_path),
         json_string(&config.cwd.to_string_lossy())
     )
 }

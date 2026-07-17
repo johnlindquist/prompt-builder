@@ -75,9 +75,19 @@ impl FilePopup {
                 self.move_down();
                 FilePopupAction::None
             }
-            KeyCode::Tab | KeyCode::BackTab => self
+            // Kitty-protocol terminals report Shift+Tab as Tab+SHIFT rather
+            // than BackTab, so check the modifier before treating Tab as accept.
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.move_up();
+                FilePopupAction::None
+            }
+            KeyCode::Tab => self
                 .selected_path()
                 .map_or(FilePopupAction::Close, FilePopupAction::Accept),
+            KeyCode::BackTab => {
+                self.move_up();
+                FilePopupAction::None
+            }
             KeyCode::Enter if key.modifiers.is_empty() => self
                 .selected_path()
                 .map_or(FilePopupAction::Close, FilePopupAction::Accept),
@@ -238,6 +248,25 @@ mod tests {
                 Some("rs")
             ),
             FilePopupAction::Forward
+        );
+    }
+
+    #[test]
+    fn shift_tab_moves_selection_up_instead_of_accepting() {
+        let mut popup = FilePopup::default();
+        popup.set_query("rs", vec![file("a.rs"), file("b.rs")]);
+
+        assert_eq!(
+            popup.handle_key(KeyEvent::from(KeyCode::Down), Some("rs")),
+            FilePopupAction::None
+        );
+        assert_eq!(
+            popup.handle_key(KeyEvent::from(KeyCode::BackTab), Some("rs")),
+            FilePopupAction::None
+        );
+        assert_eq!(
+            popup.handle_key(KeyEvent::from(KeyCode::Tab), Some("rs")),
+            FilePopupAction::Accept("a.rs".to_string())
         );
     }
 

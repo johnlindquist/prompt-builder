@@ -76,7 +76,17 @@ impl SlashPopup {
                 self.move_down();
                 SlashPopupAction::None
             }
-            KeyCode::Tab | KeyCode::BackTab => self.accept_selected(),
+            // Kitty-protocol terminals report Shift+Tab as Tab+SHIFT rather
+            // than BackTab, so check the modifier before treating Tab as accept.
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.move_up();
+                SlashPopupAction::None
+            }
+            KeyCode::Tab => self.accept_selected(),
+            KeyCode::BackTab => {
+                self.move_up();
+                SlashPopupAction::None
+            }
             KeyCode::Enter if key.modifiers.is_empty() => self.accept_selected(),
             KeyCode::Char('/') if key.modifiers.is_empty() => self.accept_selected(),
             _ => SlashPopupAction::Forward,
@@ -244,6 +254,28 @@ mod tests {
         assert_eq!(
             popup.handle_key(KeyEvent::from(KeyCode::Tab), Some("m")),
             SlashPopupAction::Accept("memories".to_string())
+        );
+    }
+
+    #[test]
+    fn shift_tab_moves_selection_up_instead_of_accepting() {
+        let mut popup = SlashPopup::default();
+        popup.set_query("m");
+
+        assert_eq!(
+            popup.handle_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+                Some("m")
+            ),
+            SlashPopupAction::None
+        );
+        assert_eq!(
+            popup.handle_key(KeyEvent::from(KeyCode::BackTab), Some("m")),
+            SlashPopupAction::None
+        );
+        assert_eq!(
+            popup.handle_key(KeyEvent::from(KeyCode::Tab), Some("m")),
+            SlashPopupAction::Accept("model".to_string())
         );
     }
 

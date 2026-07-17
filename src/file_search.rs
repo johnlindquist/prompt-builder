@@ -26,6 +26,11 @@ pub fn current_at_token(text: &str, cursor: usize, allow_empty: bool) -> Option<
     current_prefixed_token(text, cursor, '@', allow_empty)
 }
 
+/// Finds an active `$` token (skill mention) using a character-index cursor.
+pub fn current_dollar_token(text: &str, cursor: usize, allow_empty: bool) -> Option<AtToken> {
+    current_prefixed_token(text, cursor, '$', allow_empty)
+}
+
 pub fn load_file_list(cwd: &Path) -> Vec<String> {
     git_file_list(cwd).unwrap_or_else(|| fallback_file_list(cwd, FALLBACK_ENTRY_LIMIT))
 }
@@ -85,13 +90,13 @@ fn current_prefixed_token(
             right_end += 1;
         }
         if right < right_end && chars[right] == prefix {
-            return token_from_range(&chars, right, right_end, allow_empty);
+            return token_from_range(&chars, right, right_end, prefix, allow_empty);
         }
         return None;
     }
 
     if chars[start] == prefix {
-        return token_from_range(&chars, start, end, allow_empty);
+        return token_from_range(&chars, start, end, prefix, allow_empty);
     }
 
     if cursor < chars.len() && chars[cursor] == prefix {
@@ -101,7 +106,7 @@ fn current_prefixed_token(
             while prefix_end < chars.len() && !chars[prefix_end].is_whitespace() {
                 prefix_end += 1;
             }
-            return token_from_range(&chars, cursor, prefix_end, allow_empty);
+            return token_from_range(&chars, cursor, prefix_end, prefix, allow_empty);
         }
     }
 
@@ -112,9 +117,10 @@ fn token_from_range(
     chars: &[char],
     start: usize,
     end: usize,
+    prefix: char,
     allow_empty: bool,
 ) -> Option<AtToken> {
-    if start >= end || chars.get(start) != Some(&'@') {
+    if start >= end || chars.get(start) != Some(&prefix) {
         return None;
     }
     let query = chars[start + 1..end].iter().collect::<String>();
@@ -321,6 +327,23 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn current_dollar_token_finds_skill_mentions() {
+        assert_eq!(
+            current_dollar_token("say $fus", 8, false),
+            Some(AtToken {
+                query: "fus".to_string(),
+                start: 4,
+                end: 8,
+            })
+        );
+        // `$` mid-word (prices, shell vars) is not a token.
+        assert_eq!(current_dollar_token("cost 100$", 9, true), None);
+        // `@` tokens are untouched by the dollar scanner and vice versa.
+        assert_eq!(current_dollar_token("see @file", 9, true), None);
+        assert_eq!(current_at_token("run $fus", 8, true), None);
     }
 
     #[test]

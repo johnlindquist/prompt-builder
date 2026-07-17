@@ -14,6 +14,7 @@ pub enum TargetKind {
     #[default]
     Codex,
     Claude,
+    Mdflow,
 }
 
 impl TargetKind {
@@ -22,6 +23,7 @@ impl TargetKind {
             Self::Pi => "pi",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Mdflow => "mdflow",
         }
     }
 
@@ -30,6 +32,7 @@ impl TargetKind {
             Self::Pi => "pi",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Mdflow => "mdflow",
         }
     }
 
@@ -38,7 +41,10 @@ impl TargetKind {
             "pi" => Ok(Self::Pi),
             "codex" => Ok(Self::Codex),
             "claude" | "claude-code" => Ok(Self::Claude),
-            other => anyhow::bail!("unknown target kind {other:?}; expected pi, codex, or claude"),
+            "mdflow" | "md" => Ok(Self::Mdflow),
+            other => anyhow::bail!(
+                "unknown target kind {other:?}; expected pi, codex, claude, or mdflow"
+            ),
         }
     }
 }
@@ -68,6 +74,9 @@ pub struct Target {
     /// Extra argv inserted before the prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Path to an mdflow flow file. Mdflow targets only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<String>,
 }
 
 impl Target {
@@ -198,6 +207,18 @@ pub fn validate_targets(targets: &[Target]) -> anyhow::Result<()> {
         for arg in &target.args {
             reject_nul(name, "arg", arg)?;
         }
+        if let Some(flow) = &target.flow {
+            if flow.trim().is_empty() {
+                anyhow::bail!("target {name:?} has an empty flow path");
+            }
+            reject_nul(name, "flow", flow)?;
+            if target.kind != TargetKind::Mdflow {
+                anyhow::bail!(
+                    "target {name:?} sets flow but kind is {:?}; flow requires kind = \"mdflow\"",
+                    target.kind.label()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -269,8 +290,9 @@ fn default_edit_document() -> anyhow::Result<String> {
     let formatted = format_targets(&default_targets())?;
     Ok(format!(
         "# Launch targets for prompt-builder.\n\
-         # Fields: name, kind (pi|codex|claude), bin, model, args; Codex also supports\n\
-         # profile and config. Environment variables belong under [targets.env].\n\n\
+         # Fields: name, kind (pi|codex|claude|mdflow), bin, model, args; Codex also supports\n\
+         # profile and config; mdflow targets pin a flow file via flow = \"path\".\n\
+         # Environment variables belong under [targets.env].\n\n\
          {formatted}"
     ))
 }

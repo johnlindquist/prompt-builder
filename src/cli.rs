@@ -10,7 +10,7 @@ use crate::targets::TargetKind;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Terminal prompt builder for handing prompts to Pi, Codex, or Claude Code"
+    about = "Terminal prompt builder for handing prompts to Pi, Codex, Claude Code, or mdflow flows"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -133,6 +133,14 @@ pub struct Cli {
     )]
     pub claude_bin: String,
 
+    /// mdflow executable to launch for mdflow targets.
+    #[arg(
+        long = "mdflow-bin",
+        env = "PROMPT_BUILDER_MDFLOW_BIN",
+        default_value = "mdflow"
+    )]
+    pub mdflow_bin: String,
+
     /// Write structured key routing events as JSON lines for terminal debugging.
     #[arg(
         long = "debug-keys",
@@ -169,8 +177,8 @@ pub struct TargetAddArgs {
     /// Target name shown in the selector.
     pub name: String,
 
-    /// Target kind: pi, codex, or claude.
-    #[arg(long, value_name = "pi|codex|claude", default_value = "pi")]
+    /// Target kind: pi, codex, claude, or mdflow.
+    #[arg(long, value_name = "pi|codex|claude|mdflow", default_value = "pi")]
     pub kind: String,
 
     /// Executable override. Defaults to `pi`, `codex`, or `claude` by kind.
@@ -196,6 +204,10 @@ pub struct TargetAddArgs {
     /// Extra argument inserted before the prompt. Repeatable.
     #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
     pub args: Vec<String>,
+
+    /// Flow file to run. Mdflow targets only.
+    #[arg(long, value_name = "PATH")]
+    pub flow: Option<String>,
 }
 
 impl TargetAddArgs {
@@ -220,6 +232,7 @@ impl TargetAddArgs {
             model: self.model.clone(),
             config: self.config.clone(),
             args: self.args.clone(),
+            flow: self.flow.clone(),
         })
     }
 }
@@ -254,6 +267,16 @@ pub struct ClaudeLaunchConfig {
     pub cwd: PathBuf,
     pub model: Option<String>,
     /// Extra argv inserted before the prompt.
+    pub args: Vec<String>,
+    /// Environment variables set on the launched process.
+    pub env: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdflowLaunchConfig {
+    pub mdflow_bin: String,
+    pub cwd: PathBuf,
+    /// Extra argv inserted after the flow path, before template-var flags.
     pub args: Vec<String>,
     /// Environment variables set on the launched process.
     pub env: Vec<(String, String)>,
@@ -322,6 +345,30 @@ impl Cli {
             model: self.model.clone().or_else(|| target.model.clone()),
             args: target.args.clone(),
             env: target.env_pairs(),
+        }
+    }
+
+    /// mdflow launch config. When the target is mdflow-kind its bin/env/args
+    /// apply; a flow selected under any other target uses plain defaults so
+    /// the flow itself decides the engine.
+    pub fn mdflow_launch_config_for(&self, target: &Target) -> MdflowLaunchConfig {
+        if target.kind == TargetKind::Mdflow {
+            MdflowLaunchConfig {
+                mdflow_bin: target
+                    .bin
+                    .clone()
+                    .unwrap_or_else(|| self.mdflow_bin.clone()),
+                cwd: self.cwd.clone(),
+                args: target.args.clone(),
+                env: target.env_pairs(),
+            }
+        } else {
+            MdflowLaunchConfig {
+                mdflow_bin: self.mdflow_bin.clone(),
+                cwd: self.cwd.clone(),
+                args: Vec::new(),
+                env: Vec::new(),
+            }
         }
     }
 
@@ -454,6 +501,7 @@ pub(crate) fn base_cli() -> Cli {
         pi_bin: "pi".to_string(),
         codex_bin: "codex".to_string(),
         claude_bin: "claude".to_string(),
+        mdflow_bin: "mdflow".to_string(),
         handoff_command: None,
         handoff_args: Vec::new(),
         fork_from: None,
@@ -505,6 +553,7 @@ mod tests {
             model: Some("gpt-5.5".to_string()),
             config: vec!["cli_auth_credentials_store=\"file\"".to_string()],
             args: vec!["--verbose".to_string()],
+            flow: None,
         };
         let mut cli = base_cli();
         cli.model = Some("gpt-6".to_string());
